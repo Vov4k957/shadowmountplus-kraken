@@ -24,18 +24,26 @@ pub const HALF: usize = 0x2_0000;
 /// A block's largest logical size.
 pub const BLOCK: usize = 0x4_0000;
 
-/// A malformed or unsupported block. The message is fixed text.
+/// A malformed or unsupported block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Error(pub &'static str);
+pub enum Error {
+    Invalid(&'static str),
+    OutputLength { half_at: usize, expected: usize, actual: usize },
+}
 
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(self.0)
+        match self {
+            Self::Invalid(message) => f.write_str(message),
+            Self::OutputLength { half_at, expected, actual } => write!(
+                f, "kraken: half at +{half_at:#x} decodes to {actual} bytes, expected {expected}"
+            ),
+        }
     }
 }
 
 pub(crate) fn err<T>(msg: &'static str) -> Result<T, Error> {
-    Err(Error(msg))
+    Err(Error::Invalid(msg))
 }
 
 /// What a block's layout record says about how it is stored (the fields `decode_described`

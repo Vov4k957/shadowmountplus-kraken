@@ -70,6 +70,41 @@ type Write = unsafe extern "C" fn(*mut c_void, *const u8, usize, u64, *const u8,
 type LooseSize = unsafe extern "C" fn(*mut c_void, *const u8, usize, *mut u64) -> i32;
 type Progress = unsafe extern "C" fn(*mut c_void, u32, u64, u64);
 
+#[derive(Debug)]
+enum BuildError {
+    Other(String),
+    Decode(String),
+}
+
+impl From<String> for BuildError {
+    fn from(message: String) -> Self {
+        Self::Other(message)
+    }
+}
+
+impl From<Error> for BuildError {
+    fn from(error: Error) -> Self {
+        Self::from_package(error, None)
+    }
+}
+
+impl BuildError {
+    fn from_package(error: Error, path: Option<&str>) -> Self {
+        let message = match path {
+            Some(path) => format!("{path}: {error}"),
+            None => format!("{error}"),
+        };
+        match error {
+            Error::Decode(_) => Self::Decode(message),
+            _ => Self::Other(message),
+        }
+    }
+
+    fn file(path: &str, error: Error) -> Self {
+        Self::from_package(error, Some(path))
+    }
+}
+
 struct PackageIo {
     context: *mut c_void,
     read: Read,
@@ -117,15 +152,15 @@ impl PackageIo {
     }
 
     fn extract(&self, reader: &impl PRead, pkg: &Pkg, entry: &Entry<'_>, path: &str,
-               buf: &mut [u8]) -> Result<(), String> {
+               buf: &mut [u8]) -> Result<(), BuildError> {
         if entry.size == 0 {
-            return self.output(path, 0, &[]);
+            return self.output(path, 0, &[]).map_err(Into::into);
         }
         let mut offset = 0;
         while offset < entry.size {
-            let length = pkg.read_at(reader, entry, offset, buf).map_err(|e| format!("{path}: {e}"))?;
+            let length = pkg.read_at(reader, entry, offset, buf).map_err(|error| BuildError::file(path, error))?;
             if length == 0 || length as u64 > entry.size - offset {
-                return Err(format!("{path}: short package read"));
+                return Err(format!("{path}: short package read").into());
             }
             self.output(path, offset, &buf[..length])?;
             offset += length as u64;
@@ -162,37 +197,51 @@ impl PatchCache<'_> {
     }
 }
 
-fn prepare(io: &PackageIo, size: u64, mtime: i64, basename: &str) -> Result<(), String> {
-    let pkg = Pkg::open(io, size).map_err(|e| format!("{e}"))?;
+fn prepare(io: &PackageIo, size: u64, mtime: i64, basename: &str) -> Result<(), BuildError> {
+    let pkg = Pkg::open(io, size)?;
     prepare_package(io, io, &pkg, size, mtime, basename, |_, _| {}, |_, entry, _, _| {
-        let blocks = pkg.blocks(entry).map_err(|e| format!("{e}"))?;
+        let blocks = pkg.blocks(entry)?;
         Ok(blocks.iter().map(|block| original_chunk(block, block.pkg_off)).collect())
     })
 }
 
 fn prepare_patched(io: &PackageIo, patch: &impl PRead, size: u64, patch_size: u64, mtime: i64,
                    basename: &str, progress: impl Fn(u32, u64, u64),
-                   cancelled: impl Fn() -> bool) -> Result<(), String> {
+                   cancelled: impl Fn() -> bool) -> Result<(), BuildError> {
     let view = lih::View::open(io, size, patch, patch_size, &cancelled,
-                               |done, total| progress(0, done, total)).map_err(|e| format!("{e}"))?;
-    view.verify_base(|done, total| progress(1, done, total)).map_err(|e| format!("{e}"))?;
-    let pkg = Pkg::open(&view, view.len()).map_err(|e| format!("{e}"))?;
+                               |done, total| progress(0, done, total))?;
+    view.verify_base(|done, total| progress(1, done, total))?;
+    let pkg = Pkg::open(&view, view.len())?;
     prepare_package(io, &view, &pkg, size, mtime, basename,
                     |done, total| progress(2, done, total), |pkg, entry, cache, buffer| {
         if cancelled() {
-            return Err(String::from("LIH cache build cancelled"));
+            return Err(String::from("LIH cache build cancelled").into());
         }
-        let blocks = pkg.blocks(entry).ok();
+        let mut blocks = pkg.blocks(entry).unwrap_or_default().iter();
+        let mut block = blocks.next();
+        let mut block_offset = 0;
         let mut chunks = Vec::new();
-        for (i, offset) in (0..entry.size).step_by(ampr_index::BLOCK as usize).enumerate() {
+        for offset in (0..entry.size).step_by(ampr_index::BLOCK as usize) {
             let want = (entry.size - offset).min(ampr_index::BLOCK);
-            if let Some(block) = blocks.and_then(|blocks| blocks.get(i)) {
-                if u64::from(block.raw_len) >= want && u64::from(block.raw_len) <= ampr_index::BLOCK {
+            while let Some(current) = block {
+                let end = block_offset + u64::from(current.raw_len);
+                if end > offset {
+                    break;
+                }
+                block_offset = end;
+                block = blocks.next();
+            }
+            if let Some(block) = block.filter(|_| block_offset == offset) {
+                let raw_len = u64::from(block.raw_len);
+                // Only an exact 256 KiB block can be decoded whole and sliced by the runtime.
+                let reusable_tail = !block.compressed ||
+                    (raw_len == ampr_index::BLOCK && pkg.has_exact_block_starts());
+                if raw_len == want || (raw_len > want && reusable_tail) {
                     if block.stored_len == 0 {
                         chunks.push(original_chunk(block, 0));
                         continue;
                     }
-                    let run = view.locate(block.pkg_off).map_err(|e| format!("{}: {e}", entry.path))?;
+                    let run = view.locate(block.pkg_off).map_err(|error| BuildError::file(entry.path, error))?;
                     if run.source == lih::Source::Base && run.len >= u64::from(block.stored_len) {
                         chunks.push(original_chunk(block, run.offset));
                         continue;
@@ -201,9 +250,9 @@ fn prepare_patched(io: &PackageIo, patch: &impl PRead, size: u64, patch_size: u6
             }
             let buffer = &mut buffer[..want as usize];
             let count = pkg.read_at(&view, entry, offset, buffer)
-                .map_err(|e| format!("{}: {e}", entry.path))?;
+                .map_err(|error| BuildError::file(entry.path, error))?;
             if count != buffer.len() {
-                return Err(format!("{}: short LIH file read", entry.path));
+                return Err(format!("{}: short LIH file read", entry.path).into());
             }
             if buffer.iter().all(|&byte| byte == 0) {
                 chunks.push(Chunk { pkg_off: 0, stored_len: 0, raw_len: count as u32, staged: false, kraken: None });
@@ -218,11 +267,11 @@ fn prepare_patched(io: &PackageIo, patch: &impl PRead, size: u64, patch_size: u6
 fn prepare_package(
     io: &PackageIo, reader: &impl PRead, pkg: &Pkg, size: u64, mtime: i64, basename: &str,
     progress: impl Fn(u64, u64),
-    mut chunks_for_file: impl FnMut(&Pkg, &Entry<'_>, &mut PatchCache<'_>, &mut [u8]) -> Result<Vec<Chunk>, String>,
-) -> Result<(), String> {
+    mut chunks_for_file: impl FnMut(&Pkg, &Entry<'_>, &mut PatchCache<'_>, &mut [u8]) -> Result<Vec<Chunk>, BuildError>,
+) -> Result<(), BuildError> {
     for path in REQUIRED_FILES {
         if !pkg.lookup(path).is_some_and(|entry| !entry.is_dir && entry.size > 0) {
-            return Err(format!("base game file {path} is missing"));
+            return Err(format!("base game file {path} is missing").into());
         }
     }
     let mut buffer = vec![0; COPY_BUFFER];
@@ -252,13 +301,13 @@ fn prepare_package(
             continue;
         }
         if matches!(lower.as_str(), "ampr_assets.index" | "ampr_zstd.index") {
-            return Err(format!("package contains {lower}; nested AMPR packs are unsupported"));
+            return Err(format!("package contains {lower}; nested AMPR packs are unsupported").into());
         }
         if lower == "kraken" || lower.starts_with("kraken/") || lower == "kraken.image" || lower.starts_with(".smp-kraken-") {
-            return Err(format!("reserved cache path {}", entry.path));
+            return Err(format!("reserved cache path {}", entry.path).into());
         }
         if files.contains_key(&lower) {
-            return Err(format!("case-insensitive duplicate {}", entry.path));
+            return Err(format!("case-insensitive duplicate {}", entry.path).into());
         }
         let loose = io.override_size(entry.path)?;
         let extract = lower.starts_with("sce_sys/") || matches!(lower.as_str(), "eboot.bin" | "eboot2.bin") ||
@@ -287,13 +336,14 @@ fn prepare_package(
     }
     io.output("ampr_emu.index", 0, &images.index)?;
     io.output("ampr_assets.index", 0, &images.manifest)?;
-    io.output("kraken.image", 0, format!("kraken/{basename}").as_bytes())
+    io.output("kraken.image", 0, format!("kraken/{basename}").as_bytes())?;
+    Ok(())
 }
 
-fn package_basename(bytes: &[u8]) -> Result<&str, String> {
+fn package_basename(bytes: &[u8]) -> Result<&str, BuildError> {
     let name = str::from_utf8(bytes).map_err(|_| String::from("package basename must be UTF-8"))?;
     if name.is_empty() || name.len() > 255 || name.contains(['/', '\\', '\r', '\n', '\0']) {
-        return Err(String::from("invalid package basename"));
+        return Err(String::from("invalid package basename").into());
     }
     Ok(name)
 }
@@ -327,10 +377,14 @@ pub unsafe extern "C" fn sm_kraken_build_patched_index(
     unsafe { report_result(result, error, error_len) }
 }
 
-unsafe fn report_result(result: Result<(), String>, error: *mut u8, error_len: usize) -> i32 {
+unsafe fn report_result(result: Result<(), BuildError>, error: *mut u8, error_len: usize) -> i32 {
     match result {
         Ok(()) => 0,
-        Err(msg) => {
+        Err(error_kind) => {
+            let (code, msg) = match error_kind {
+                BuildError::Other(msg) => (-1, msg),
+                BuildError::Decode(msg) => (-2, msg),
+            };
             if error_len > 0 {
                 let length = msg.len().min(error_len - 1);
                 unsafe {
@@ -338,7 +392,7 @@ unsafe fn report_result(result: Result<(), String>, error: *mut u8, error_len: u
                     *error.add(length) = 0;
                 }
             }
-            -1
+            code
         }
     }
 }

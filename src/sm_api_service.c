@@ -2222,6 +2222,7 @@ static const char *operation_error_message(int status, const char *reason) {
       {"pkg_queued", "the package is already queued"},
       {"pkg_queue_full", "the installation queue is full (32 packages)"},
       {"kraken_patch_invalid", "LIH update does not match a supported base PKG or failed validation; see the debug log"},
+      {"kraken_decode_failed", "failed to decode a Kraken block; see the debug log"},
       {"kraken_base_missing", "mount the matching base PKG with U first"},
       {"kraken_base_invalid", "the base PKG could not be mounted; see the debug log"},
       {"kraken_title_conflict", "another source is already registered for this title"},
@@ -4194,6 +4195,8 @@ static void run_kraken_job(uint64_t job_id, const char *title_id,
       status = errno ? errno : EIO;
       if (status == EAGAIN)
         error = "kraken_sources_changed";
+      else if (status == EILSEQ)
+        error = "kraken_decode_failed";
       else if (status == EINVAL)
         error = update ? "kraken_patch_invalid" : "kraken_base_invalid";
     } else if (!update) {

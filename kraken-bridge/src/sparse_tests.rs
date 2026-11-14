@@ -66,14 +66,29 @@ fn kraken_record(logical: usize, stored_end: usize, len: usize) -> u128 {
     record | ((stored_end % BLOCK) as u128) << 48
 }
 
+fn lz_asset() -> Vec<u8> {
+    let mut stored = b"rusttest".to_vec();
+    stored.push(0x80); // No length escapes.
+    for array in [&b"end"[..], &[60], &[], &[23]] {
+        stored.extend_from_slice(&[0, 0, array.len() as u8]);
+        stored.extend_from_slice(array);
+    }
+    stored
+}
+
 // Synthetic plaintext debug package with an all-zero file followed by a
 // stored file and the inode table. The all-zero file has no stored records.
 fn synthetic_pkg(zero_len: usize) -> Vec<u8> {
+    synthetic_pkg_with_assets(zero_len, &[], None)
+}
+
+fn synthetic_pkg_with_assets(zero_len: usize, leading_raw: &[u8], compressed: Option<(&[u8], usize, u8)>) -> Vec<u8> {
     let data_base = zero_len.next_multiple_of(PAGE);
     let padding = data_base - zero_len;
+    let first_asset = leading_raw.len() + padding;
     let meta = data_base + PAGE;
     let mount_end = meta + 3 * PAGE;
-    let stored_meta = padding + PAGE;
+    let stored_meta = first_asset + PAGE;
     let stored_size = stored_meta + 3 * PAGE;
     let cnt = IMAGE + stored_size.next_multiple_of(PAGE);
     let mut pkg = vec![0; cnt + 0x1000];
@@ -98,18 +113,31 @@ fn synthetic_pkg(zero_len: usize) -> Vec<u8> {
     outer_inode(&mut pkg, 2, stored_size, 7);
 
     let mut bounds = vec![(0, 0x40)];
+    let mut records = vec![0u128]; // The first stored block starts at offset zero.
+    if !leading_raw.is_empty() {
+        let logical = zero_len - leading_raw.len();
+        bounds.push((logical, 0));
+        records[0] = ((logical % BLOCK / 16) as u128) << 68;
+        records.push(kraken_record(logical, leading_raw.len(), leading_raw.len()));
+    }
     if padding != 0 {
         bounds.push((zero_len, 0));
+        records.push(kraken_record(zero_len, first_asset, padding));
     }
     bounds.extend((0..4).map(|slot| (data_base + slot * 128, 0)));
     bounds.extend([(meta, 0), (mount_end, 0x40)]);
-    let mut records = vec![0]; // The first stored block starts at offset zero.
-    if padding != 0 {
-        records.push(kraken_record(zero_len, padding, padding));
-    }
     for slot in 0..4 {
         let end = if slot == 3 { PAGE } else { (slot + 1) * 128 };
-        records.push(kraken_record(data_base + slot * 128, padding + end, end - slot * 128));
+        let mut record = kraken_record(data_base + slot * 128, first_asset + end, end - slot * 128);
+        if let Some((stored, _, _)) = compressed.filter(|_| slot == 0) {
+            record = kraken_record(data_base, first_asset + stored.len(), stored.len()) | 2 << 32 | RUN_END;
+        }
+        records.push(record);
+        if compressed.is_some() && slot == 0 {
+            // The next file is aligned at 128 bytes. The gap has no stored LZ bytes.
+            let at = first_asset + 128;
+            records.push(((at as u128 / BLOCK as u128) << 26) | ((at % BLOCK) as u128) << 48);
+        }
     }
     records.push(kraken_record(meta, stored_size, 3 * PAGE) | RUN_END);
     records.extend([1 << 67, 0]); // Terminator and sentinel.
@@ -119,6 +147,9 @@ fn synthetic_pkg(zero_len: usize) -> Vec<u8> {
     let layout = &mut pkg[LAYOUT..LAYOUT + descriptor_len];
     put64(layout, 0, ((bounds.len() - 1) as u64) | 2 << 24 | (ublocks as u64) << 32);
     put64(layout, 8, ((records.len() - 2) as u64) << 24);
+    if let Some((_, _, tag)) = compressed {
+        layout[first_record - 1] = tag;
+    }
     for (entry, (offset, kind)) in layout[16..].chunks_exact_mut(6).zip(bounds) {
         entry[..5].copy_from_slice(&(offset as u64).to_le_bytes()[..5]);
         entry[5] = kind;
@@ -129,8 +160,9 @@ fn synthetic_pkg(zero_len: usize) -> Vec<u8> {
     outer_inode(&mut pkg, 3, descriptor_len, 6);
 
     let image = &mut pkg[IMAGE..IMAGE + stored_size];
+    image[..leading_raw.len()].copy_from_slice(leading_raw);
     // Build the inner metadata using its layout relative to the stored payload.
-    let image = &mut image[padding..];
+    let image = &mut image[first_asset..];
     let data_files = [
         (6, "other.bin", &b"asset from package"[..]),
         (7, "eboot.bin", &b"synthetic executable"[..]),
@@ -141,6 +173,11 @@ fn synthetic_pkg(zero_len: usize) -> Vec<u8> {
         let slot = i * 128;
         image[slot..slot + bytes.len()].copy_from_slice(bytes);
         inner_inode(image, *inode, 0x8000, data_base + slot, bytes.len());
+    }
+    if let Some((stored, size, _)) = compressed {
+        image[..128].fill(0);
+        image[..stored.len()].copy_from_slice(stored);
+        inner_inode(image, 6, 0x8000, data_base, size);
     }
     put64(image, PAGE, 2);
     put64(image, PAGE + 8, 20_130_315);
@@ -296,6 +333,63 @@ fn lih_reads_updated_asset_and_preserves_sparse_chunks() {
 }
 
 #[test]
+fn lih_decodes_an_lz_file_up_to_its_inode_end() {
+    let title = b"UP0001-PPSA54321_00-SYNTHETICPACKAGE";
+    let base = with_digests(synthetic_pkg(BLOCK), title);
+    let stored = lz_asset();
+    let expected = b"rusttest".repeat(6).into_iter().chain(*b"end").collect::<Vec<_>>();
+    for (size, tag, encoded) in [
+        (expected.len(), 6, stored.clone()),
+        (expected.len() + 1, 6, stored.clone()),
+        (expected.len(), 4, stored.clone()),
+        (expected.len(), 6, { let mut bytes = stored.clone(); bytes.push(0); bytes }),
+    ] {
+        let target = with_digests(synthetic_pkg_with_assets(BLOCK, &[], Some((&encoded, size, tag))), title);
+        let patch = make_patch(&base, &target);
+        let mut io = TestIo { pkg: base.clone(), files: BTreeMap::new() };
+        let reader = PackageIo { context: ptr::from_mut(&mut io).cast(), read, write, loose_size };
+        let result = prepare_patched(&reader, &patch, base.len() as u64, patch.0.len() as u64,
+                                     1, "base.pkg", |_, _, _| {}, || false);
+        if size == expected.len() && tag == 6 && encoded == stored {
+            result.unwrap();
+            let manifest = &io.files["ampr_assets.index"];
+            let loc = get64(manifest, get64(manifest, 80) as usize);
+            assert_eq!(loc >> 48, 1);
+            let offset = (loc & ((1 << 48) - 1)) as usize;
+            assert_eq!(&io.files[".smp-kraken-patch.pak"][offset..offset + size], expected);
+        } else {
+            let error = result.unwrap_err();
+            assert!(matches!(&error, super::BuildError::Decode(message) if message.starts_with("other.bin: Kraken decode failed")), "{error:?}");
+            assert!(!io.files.contains_key("ampr_assets.index"));
+        }
+    }
+}
+
+#[test]
+fn lih_indexes_chunks_by_file_offset() {
+    let title = b"EP0000-PPSA01234_00-SYNTHETICPACKAGE";
+    // A 64 KiB hole followed by a full raw block. The second index chunk
+    // starts 192 KiB into the raw block.
+    let mut raw = vec![0x37; BLOCK];
+    raw[BLOCK - PAGE..].fill(0x6b);
+    let base = with_digests(synthetic_pkg_with_assets(BLOCK + PAGE, &raw, None), title);
+    let mut target = base.clone();
+    target[IMAGE + BLOCK..IMAGE + BLOCK + 18].copy_from_slice(b"russian audio data");
+    let target = with_digests(target, title);
+    let patch = make_patch(&base, &target);
+    let mut io = TestIo { pkg: base.clone(), files: BTreeMap::new() };
+    let reader = PackageIo { context: ptr::from_mut(&mut io).cast(), read, write, loose_size };
+    prepare_patched(&reader, &patch, base.len() as u64, patch.0.len() as u64,
+                    1, "base.pkg", |_, _, _| {}, || false).unwrap();
+    let manifest = &io.files["ampr_assets.index"];
+    let chunks = get64(manifest, 80) as usize;
+    let last_chunk = get64(manifest, chunks + 24);
+    assert_eq!(last_chunk >> 48, 1);
+    let offset = (last_chunk & ((1 << 48) - 1)) as usize;
+    assert_eq!(&io.files[".smp-kraken-patch.pak"][offset..offset + PAGE], &raw[BLOCK - PAGE..]);
+}
+
+#[test]
 fn lih_applies_across_title_ids_and_rejects_another_title() {
     let title = b"UP0001-PPSA54321_00-SYNTHETICPACKAGE";
     let base = with_digests(synthetic_pkg(BLOCK), title);
@@ -352,11 +446,11 @@ fn check_lih(content_id: &[u8; 36], asset: &[u8; 18]) {
     io.files.clear();
     let err = prepare_patched(&reader, &patch, base_size, patch_size, 1, "base.pkg", |_, _, _| {}, || false)
         .unwrap_err();
-    assert!(err.contains("fails its LIH digest"), "{err}");
+    assert!(matches!(&err, super::BuildError::Other(msg) if msg.contains("fails its LIH digest")), "{err:?}");
     assert!(io.files.is_empty());
     io.pkg = with_digests(io.pkg, content_id);
     let err = prepare_patched(&reader, &patch, base_size, patch_size, 1, "base.pkg", |_, _, _| {}, || false)
         .unwrap_err();
-    assert!(err.contains("blocks absent"), "{err}");
+    assert!(matches!(&err, super::BuildError::Other(msg) if msg.contains("blocks absent")), "{err:?}");
     assert!(io.files.is_empty());
 }

@@ -7,7 +7,7 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::kraken::{KBlock, Kraken};
+use crate::kraken::{KBlock, Kraken, EXACT_LAYOUT};
 use crate::outer::{self, OuterFile};
 use crate::{Error, Extent, PRead};
 
@@ -63,8 +63,8 @@ pub(crate) struct Decoder {
     scratch: Option<Box<crate::decoder::Scratch>>,
     src: Vec<u8>,
     dst: Vec<u8>,
-    /// Mount offset of the block whose logical bytes are in `dst`.
-    cached: Option<u64>,
+    /// Mount offset and file boundary used to decode the bytes in `dst`.
+    cached: Option<(u64, Option<u64>)>,
 }
 
 impl Decoder {
@@ -277,30 +277,50 @@ impl Image {
     }
 
     /// Read block `b`'s stored bytes and decode them into `dec.dst` (kept as a one-block cache).
-    fn decode<R: PRead>(&self, io: &R, b: &KBlock, dec: &mut Decoder) -> Result<(), Error> {
-        if dec.cached == Some(b.logical) {
+    fn decode<R: PRead>(&self, io: &R, b: &KBlock, file_end: Option<u64>, dec: &mut Decoder) -> Result<(), Error> {
+        let key = (b.logical, file_end);
+        if dec.cached == Some(key) {
             return Ok(());
         }
         dec.cached = None;
-        let mut runs = Vec::new();
-        self.image.pkg_extents(b.stored_at, u64::from(b.stored_len), &mut runs)?;
         dec.src.resize(b.stored_len as usize, 0);
-        let mut done = 0usize;
-        for r in runs {
-            let n = r.len as usize;
-            pread_exact(io, r.pkg_off, &mut dec.src[done..done + n])?;
-            done += n;
-        }
+        self.image.read(io, b.stored_at, &mut dec.src)?;
         dec.dst.resize(b.len as usize, 0);
         let scratch = dec.scratch.get_or_insert_with(crate::decoder::Scratch::new_boxed);
-        crate::decoder::decode_block(&dec.src, b.desc, &mut dec.dst, scratch)
-            .map_err(|e| corrupt(format!("the block at mount {:#x}: {e}", b.logical)))?;
-        dec.cached = Some(b.logical);
+        if let Err(error) = crate::decoder::decode_block(&dec.src, b.desc, &mut dec.dst, scratch) {
+            // Some layouts infer a block's length from its next boundary, which can
+            // include padding after the last byte of the file. The inode's end and
+            // the LZ stream must agree before we use a shorter decoded block.
+            let format_error = |e| Error::Decode(format!(
+                "mount {:#x}, stored {:#x}, len {}, stored len {}, even {}, mode {:#x}, tag {:02x?}, file end {file_end:x?}: {e}",
+                b.logical, b.stored_at, b.len, b.stored_len, b.desc.even_len, b.desc.mode, self.kraken.tag,
+            ));
+            let crate::decoder::Error::OutputLength { half_at, actual, .. } = error else {
+                return Err(format_error(error));
+            };
+            let tail = half_at + actual;
+            if self.kraken.tag == EXACT_LAYOUT || tail >= b.len as usize ||
+                file_end != Some(b.logical + tail as u64) {
+                return Err(format_error(error));
+            }
+            dec.dst.truncate(tail);
+            crate::decoder::decode_block(&dec.src, b.desc, &mut dec.dst, scratch)
+                .map_err(format_error)?;
+        }
+        dec.cached = Some(key);
         Ok(())
     }
 
     /// Exactly `buf.len()` mount bytes at `off`. Sparse blocks read as zeros.
     pub fn read_mount<R: PRead>(&self, io: &R, off: u64, buf: &mut [u8], dec: &mut Decoder) -> Result<(), Error> {
+        self.read_mount_range(io, off, buf, dec, None)
+    }
+
+    pub fn read_file<R: PRead>(&self, io: &R, off: u64, end: u64, buf: &mut [u8], dec: &mut Decoder) -> Result<(), Error> {
+        self.read_mount_range(io, off, buf, dec, Some(end))
+    }
+
+    fn read_mount_range<R: PRead>(&self, io: &R, off: u64, buf: &mut [u8], dec: &mut Decoder, file_end: Option<u64>) -> Result<(), Error> {
         #[cfg(feature = "probe")]
         if let Some(m) = &self.probe_mount {
             let src = m.get(off as usize..off as usize + buf.len()).ok_or_else(|| corrupt("past the decoded mount"))?;
@@ -327,8 +347,10 @@ impl Image {
                     at += k;
                 }
             } else {
-                self.decode(io, b, dec)?;
-                out.copy_from_slice(&dec.dst[inner..inner + n]);
+                self.decode(io, b, file_end, dec)?;
+                let decoded = dec.dst.get(inner..inner + n)
+                    .ok_or_else(|| corrupt("the decoded block does not cover the requested file bytes"))?;
+                out.copy_from_slice(decoded);
             }
             done += n;
         }

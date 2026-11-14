@@ -23,6 +23,7 @@ const MAX_DESCRIPTOR: u64 = 384 << 20;
 /// Records (9 B each) and boundary entries (6 B each) read per chunk.
 const CHUNK: usize = 4096;
 const REPACK: &str = "repack with --kraken stored";
+pub(crate) const EXACT_LAYOUT: [u8; 3] = [0x00, 0x00, 0x04];
 
 /// One mount block: `len` logical bytes at `logical`, stored in `stored_len` bytes at
 /// `stored_at` in `pfs_image.dat`, decoded with `desc`.
@@ -52,6 +53,7 @@ impl KBlock {
 pub(crate) struct Kraken {
     pub blocks: Vec<KBlock>,
     pub mount_size: u64,
+    pub tag: [u8; 3],
 }
 
 struct Boundaries {
@@ -184,7 +186,7 @@ impl Kraken {
         let mount = bounds.mount;
         let mut tag = [0u8; 3];
         naps.read(io, (rec_at - 3) as u64, &mut tag)?;
-        let strict = tag == [0x00, 0x00, 0x04];
+        let strict = tag == EXACT_LAYOUT;
         let mut rec = Records { io, file: naps, at: rec_at as u64, count: records, start: 0, loaded: 0, buf: Vec::new() };
         let mut blocks: Vec<KBlock> = Vec::with_capacity((ublocks as usize + files).min(1 << 22));
         let (mut cursor, mut logical) = (0u64, 0u64);
@@ -259,7 +261,7 @@ impl Kraken {
             return Err(corrupt(format!("blocks tile to {logical:#x}, the mount is {mount:#x}")));
         }
         blocks.shrink_to_fit();
-        Ok(Self { blocks, mount_size: mount })
+        Ok(Self { blocks, mount_size: mount, tag })
     }
 }
 

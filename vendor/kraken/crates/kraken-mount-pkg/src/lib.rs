@@ -41,6 +41,8 @@ pub enum Error {
     Unsupported(String),
     /// The package contradicts itself or is truncated.
     Corrupt(String),
+    /// A mapped block could not be decoded to its expected length.
+    Decode(String),
 }
 
 impl fmt::Display for Error {
@@ -50,6 +52,7 @@ impl fmt::Display for Error {
             Error::NotPs5(m) => write!(f, "not a PS5 package: {m}"),
             Error::Unsupported(m) => write!(f, "unsupported package: {m}"),
             Error::Corrupt(m) => write!(f, "corrupt package: {m}"),
+            Error::Decode(m) => write!(f, "Kraken decode failed: {m}"),
         }
     }
 }
@@ -324,7 +327,7 @@ impl Pkg {
         let want = (n.size - off).min(buf.len() as u64) as usize;
         if !n.ext_ok {
             let mut dec = pkg::Decoder::new();
-            self.image.read_mount(io, n.logical + off, &mut buf[..want], &mut dec)?;
+            self.image.read_file(io, n.logical + off, n.logical + n.size, &mut buf[..want], &mut dec)?;
             return Ok(want);
         }
         let range = n.ext_start as usize..n.ext_end as usize;
@@ -342,6 +345,11 @@ impl Pkg {
             i += 1;
         }
         Ok(done)
+    }
+
+    /// Whether the descriptor encodes exact block starts, including the low four bits.
+    pub fn has_exact_block_starts(&self) -> bool {
+        self.image.kraken.tag == kraken::EXACT_LAYOUT
     }
 }
 

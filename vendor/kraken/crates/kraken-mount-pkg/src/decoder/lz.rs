@@ -744,11 +744,6 @@ pub(crate) fn decode_half(src: &[u8], out: &mut [u8], at: usize, len: usize, del
     };
     #[cfg(feature = "phase_timing")]
     let t0 = crate::decoder::timing::phase::now();
-    if lits.len() - lit_at != end - dst {
-        return err("kraken: trailing literals do not fill the half");
-    }
-    // SAFETY: `lits.len() - lit_at == end - dst`, just checked; `recent[0]` as in the loop.
-    unsafe { put_literals(op, dst, end, lits, lit_at, end - dst, delta, recent[0]) };
     if offs.used() != offs.codes.len() || lens.k != lens.lens.len() {
         return err("kraken: unused offsets or lengths");
     }
@@ -758,6 +753,12 @@ pub(crate) fn decode_half(src: &[u8], out: &mut [u8], at: usize, len: usize, del
     if lens.ea.seam() != lens.eb.seam() {
         return err("kraken: excess streams do not meet");
     }
+    let tail = lits.len() - lit_at;
+    if tail != end - dst {
+        return Err(Error::OutputLength { half_at: at, expected: len, actual: dst - at + tail });
+    }
+    // SAFETY: `tail == end - dst` as checked above; `recent[0]` as in the loop.
+    unsafe { put_literals(op, dst, end, lits, lit_at, tail, delta, recent[0]) };
     #[cfg(feature = "phase_timing")]
     crate::decoder::timing::phase::add(6, t0, 0);
     Ok(())

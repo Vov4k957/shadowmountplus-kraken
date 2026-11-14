@@ -18,6 +18,7 @@
 #define KRAKEN_MARKER ".smp-kraken-source"
 #define KRAKEN_MANIFEST ".smp-kraken-built"
 #define KRAKEN_REVISION "2"
+#define KRAKEN_PATCH_REVISION "3"
 #define KRAKEN_PATCH_VOLUME ".smp-kraken-patch.pak"
 
 extern const unsigned char sm_kraken_runtime_start[];
@@ -630,7 +631,7 @@ static bool stage_backport_libraries(const char *backport, cache_io_t *io) {
 }
 
 static bool source_signature(const sm_pkg_info_t *info, const char *backport,
-                             char out[280]) {
+                             const char *revision, char out[280]) {
   uint64_t signature = 0;
   if (*backport) {
     char path[MAX_PATH];
@@ -640,7 +641,7 @@ static bool source_signature(const sm_pkg_info_t *info, const char *backport,
       return false;
   }
   int written = snprintf(out, 280, "%s %s %llx %llx %llx %llx %lx %llx %lx %llx\n",
-                         KRAKEN_REVISION, sm_kraken_revision,
+                         revision, sm_kraken_revision,
                          (unsigned long long)info->source_device, (unsigned long long)info->source_inode,
                          (unsigned long long)info->source_size, (unsigned long long)info->source_mtime,
                          (unsigned long)info->source_mtime_ns, (unsigned long long)info->source_ctime,
@@ -710,8 +711,8 @@ static bool prepare_cache(const sm_pkg_info_t *info, const sm_pkg_info_t *patch,
     return false;
   *separator = '\0';
   (void)resolve_backport_path_for_title(info->title_id, package_dir, backport);
-  if (!source_signature(info, backport, current) ||
-      (patch && !source_signature(patch, "", patch_signature)))
+  if (!source_signature(info, backport, KRAKEN_REVISION, current) ||
+      (patch && !source_signature(patch, "", KRAKEN_PATCH_REVISION, patch_signature)))
     return false;
 
   if (read_cache_marker(cache, existing, saved, sizeof(saved), &old_patch) &&
@@ -765,7 +766,7 @@ static bool prepare_cache(const sm_pkg_info_t *info, const sm_pkg_info_t *patch,
   cache_io_t io = {.package_fd = fd, .patch_fd = patch_fd, .patch_output_fd = -1,
                    .output_fd = -1, .staging = staging, .job = job};
   char package_mount[MAX_PATH];
-  char build_error[320] = "";
+  char build_error[MAX_PATH + 256] = "";
   const char *name = strrchr(info->path, '/') + 1;
   bool ready = chmod(staging, 0777) == 0 &&
       join_path(staging, SM_KRAKEN_PACKAGE_DIR, package_mount) &&
@@ -783,7 +784,7 @@ static bool prepare_cache(const sm_pkg_info_t *info, const sm_pkg_info_t *patch,
         message, sizeof(build_error));
     ready = result == 0;
     if (!ready)
-      errno = io.error ? io.error : EINVAL;
+      errno = io.error ? io.error : (result == -2 ? EILSEQ : EINVAL);
   }
   if (ready) {
     const char runtime[] = "fakelib2/libSceAmpr.sprx";
@@ -799,7 +800,8 @@ static bool prepare_cache(const sm_pkg_info_t *info, const sm_pkg_info_t *patch,
     error = errno;
   char final_signature[280];
   if (error == 0 && (!package_unchanged(info, fd) ||
-      !source_signature(info, backport, final_signature) || strcmp(current, final_signature) != 0))
+      !source_signature(info, backport, KRAKEN_REVISION, final_signature) ||
+      strcmp(current, final_signature) != 0))
     error = EAGAIN;
   close(fd);
   if (patch_fd >= 0) {
