@@ -66,35 +66,50 @@ impl BlockLength {
     fn resolve<R: PRead>(
         &mut self, io: &R, image: &OuterFile, block: &KBlock, lengths: RangeInclusive<u32>,
     ) -> Result<u32, Error> {
+        let decode_error = |e| Error::Decode(format!(
+            "mount {:#x}, stored {:#x}, stored len {}, even {}, mode {:#x}, allowed lengths {lengths:?}: {e}",
+            block.logical, block.stored_at, block.stored_len, block.desc.even_len, block.desc.mode,
+        ));
+        let half = decoder::HALF as u32;
+        let (mut min, mut max) = (*lengths.start(), *lengths.end());
+        let Some(odd_stored) = block.stored_len.checked_sub(block.desc.even_len) else {
+            return Err(decode_error(decoder::Error::Invalid("kraken: the even half exceeds the stored span")));
+        };
+        // The record gives the first half's stored size. If it consumes the
+        // entire span, the 16-byte uncertainty cannot add a second half.
+        if odd_stored == 0 {
+            max = max.min(half);
+        } else {
+            min = min.max(half + 1);
+        }
+        if min > max {
+            return Err(decode_error(decoder::Error::Invalid("kraken: the stored half count disagrees with the layout")));
+        }
+        let candidates = min..=max;
         // Raw bytes already agree with the original geometry, or their stored
         // length supplies the endpoint within the range allowed by the record.
-        if block.desc.mode & 0b1_1011 == 0 && lengths.contains(&block.stored_len) &&
+        if block.desc.mode & 0b1_1011 == 0 && candidates.contains(&block.stored_len) &&
             u64::from(block.desc.even_len) == u64::from(block.stored_len).min(HALF) {
             return Ok(block.stored_len);
         }
         self.src.resize(block.stored_len as usize, 0);
         image.read(io, block.stored_at, &mut self.src)?;
         let scratch = self.scratch.get_or_insert_with(Scratch::new_boxed);
-        let max = *lengths.end();
         self.dst.resize(max as usize, 0);
         let error = match decoder::decode_block(&self.src, block.desc, &mut self.dst, scratch) {
             Ok(_) => return Ok(max),
             Err(error) => error,
         };
 
-        let decode_error = |e| Error::Decode(format!(
-            "mount {:#x}, stored {:#x}, stored len {}, even {}, mode {:#x}, allowed lengths {lengths:?}: {e}",
-            block.logical, block.stored_at, block.stored_len, block.desc.even_len, block.desc.mode,
-        ));
         let length = match error {
             decoder::Error::OutputLength { half_at, actual, .. } => (half_at + actual) as u32,
-            _ if block.stored_len > block.desc.even_len && block.desc.mode & 0x10 == 0 => {
+            _ if odd_stored != 0 && block.desc.mode & 0x10 == 0 => {
                 // The second half can be a plain copy while the first is compressed.
-                decoder::HALF as u32 + block.stored_len - block.desc.even_len
+                half + odd_stored
             }
             _ => return Err(decode_error(error)),
         };
-        if length == max || !lengths.contains(&length) {
+        if length == max || !candidates.contains(&length) {
             return Err(decode_error(error));
         }
         self.dst.truncate(length as usize);

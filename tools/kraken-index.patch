@@ -431,7 +431,7 @@ diff --git a/crates/kraken-mount-pkg/src/kraken.rs b/crates/kraken-mount-pkg/src
      /// Stored as a plain copy of its logical bytes (no decoding needed).
      pub fn raw(&self) -> bool {
          self.stored_len == self.len
-@@ -44,10 +52,94 @@
+@@ -44,10 +52,109 @@
      }
  }
  
@@ -449,35 +449,50 @@ diff --git a/crates/kraken-mount-pkg/src/kraken.rs b/crates/kraken-mount-pkg/src
 +    fn resolve<R: PRead>(
 +        &mut self, io: &R, image: &OuterFile, block: &KBlock, lengths: RangeInclusive<u32>,
 +    ) -> Result<u32, Error> {
++        let decode_error = |e| Error::Decode(format!(
++            "mount {:#x}, stored {:#x}, stored len {}, even {}, mode {:#x}, allowed lengths {lengths:?}: {e}",
++            block.logical, block.stored_at, block.stored_len, block.desc.even_len, block.desc.mode,
++        ));
++        let half = decoder::HALF as u32;
++        let (mut min, mut max) = (*lengths.start(), *lengths.end());
++        let Some(odd_stored) = block.stored_len.checked_sub(block.desc.even_len) else {
++            return Err(decode_error(decoder::Error::Invalid("kraken: the even half exceeds the stored span")));
++        };
++        // The record gives the first half's stored size. If it consumes the
++        // entire span, the 16-byte uncertainty cannot add a second half.
++        if odd_stored == 0 {
++            max = max.min(half);
++        } else {
++            min = min.max(half + 1);
++        }
++        if min > max {
++            return Err(decode_error(decoder::Error::Invalid("kraken: the stored half count disagrees with the layout")));
++        }
++        let candidates = min..=max;
 +        // Raw bytes already agree with the original geometry, or their stored
 +        // length supplies the endpoint within the range allowed by the record.
-+        if block.desc.mode & 0b1_1011 == 0 && lengths.contains(&block.stored_len) &&
++        if block.desc.mode & 0b1_1011 == 0 && candidates.contains(&block.stored_len) &&
 +            u64::from(block.desc.even_len) == u64::from(block.stored_len).min(HALF) {
 +            return Ok(block.stored_len);
 +        }
 +        self.src.resize(block.stored_len as usize, 0);
 +        image.read(io, block.stored_at, &mut self.src)?;
 +        let scratch = self.scratch.get_or_insert_with(Scratch::new_boxed);
-+        let max = *lengths.end();
 +        self.dst.resize(max as usize, 0);
 +        let error = match decoder::decode_block(&self.src, block.desc, &mut self.dst, scratch) {
 +            Ok(_) => return Ok(max),
 +            Err(error) => error,
 +        };
 +
-+        let decode_error = |e| Error::Decode(format!(
-+            "mount {:#x}, stored {:#x}, stored len {}, even {}, mode {:#x}, allowed lengths {lengths:?}: {e}",
-+            block.logical, block.stored_at, block.stored_len, block.desc.even_len, block.desc.mode,
-+        ));
 +        let length = match error {
 +            decoder::Error::OutputLength { half_at, actual, .. } => (half_at + actual) as u32,
-+            _ if block.stored_len > block.desc.even_len && block.desc.mode & 0x10 == 0 => {
++            _ if odd_stored != 0 && block.desc.mode & 0x10 == 0 => {
 +                // The second half can be a plain copy while the first is compressed.
-+                decoder::HALF as u32 + block.stored_len - block.desc.even_len
++                half + odd_stored
 +            }
 +            _ => return Err(decode_error(error)),
 +        };
-+        if length == max || !lengths.contains(&length) {
++        if length == max || !candidates.contains(&length) {
 +            return Err(decode_error(error));
 +        }
 +        self.dst.truncate(length as usize);
@@ -526,7 +541,7 @@ diff --git a/crates/kraken-mount-pkg/src/kraken.rs b/crates/kraken-mount-pkg/src
  }
  
  /// The descriptor's 9-byte records, read `CHUNK` at a time. Lookups move forward and look at
-@@ -113,9 +205,11 @@
+@@ -113,9 +220,11 @@
  }
  
  impl Kraken {
@@ -541,7 +556,7 @@ diff --git a/crates/kraken-mount-pkg/src/kraken.rs b/crates/kraken-mount-pkg/src
          if naps.size < 16 || naps.size > MAX_DESCRIPTOR {
              return Err(corrupt(format!("layout descriptor of {} bytes", naps.size)));
          }
-@@ -144,19 +238,24 @@
+@@ -144,19 +253,24 @@
          if naps.size < (rec_at + records * 9) as u64 {
              return Err(corrupt("layout descriptor shorter than its records"));
          }
@@ -571,7 +586,7 @@ diff --git a/crates/kraken-mount-pkg/src/kraken.rs b/crates/kraken-mount-pkg/src
              let v = rec.get(i)?;
              let f = |lo: u32, w: u32| ((v >> lo) & ((1u128 << w) - 1)) as u64;
              let nibble = core::mem::replace(&mut carried_nibble, f(68, 4));
-@@ -170,6 +269,7 @@
+@@ -170,6 +284,7 @@
                  }
                  continue;
              }
@@ -579,7 +594,7 @@ diff --git a/crates/kraken-mount-pkg/src/kraken.rs b/crates/kraken-mount-pkg/src
              if strict && i > 0 && nibble != logical & 0xF {
                  return Err(corrupt(format!("record {i}: the exact start's low nibble disagrees")));
              }
-@@ -179,11 +279,22 @@
+@@ -179,11 +294,22 @@
              if (logical % WINDOW) >> 4 != f(0, 14) {
                  return Err(corrupt(format!("record {i}: logical offset disagrees")));
              }
@@ -603,7 +618,7 @@ diff --git a/crates/kraken-mount-pkg/src/kraken.rs b/crates/kraken-mount-pkg/src
                  let low = if strict { (rec.get(next - 1)? >> 68) as u64 & 0xF } else { logical & 0xF };
                  let exact = at16 | low;
                  if at16 + 16 <= cap || (strict && exact < cap) { exact - logical } else { cap - logical }
-@@ -206,39 +317,49 @@
+@@ -206,39 +332,49 @@
              if f(44, 4) != 0 {
                  return Err(unsupported(format!("block at mount {logical:#x} is byte-shuffled; {REPACK}")));
              }
@@ -663,7 +678,7 @@ diff --git a/crates/kraken-mount-pkg/src/kraken.rs b/crates/kraken-mount-pkg/src
      let mut buf = vec![0u8; CHUNK * 6];
      let mut done = 0usize;
      while done < files {
-@@ -248,22 +369,21 @@
+@@ -248,22 +384,21 @@
          for r in chunk.chunks_exact(6) {
              let off = u64::from_le_bytes([r[0], r[1], r[2], r[3], r[4], 0, 0, 0]);
              if r[5] == 0x40 {
