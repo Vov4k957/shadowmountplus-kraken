@@ -1,5 +1,5 @@
 //! Read a ps5-dump-forge debug FPKG (`.pkg`) in place: plaintext (`PPRPLAIN-NOAUTH!`), Kraken
-//! layout at any level (`stored` or Kraken-compressed blocks, no byte shuffles), no LIH patch.
+//! layout with stored, Kraken-compressed or sparse blocks, without byte shuffles or LIH patches.
 //! Every file maps to a list of Kraken blocks; files whose blocks are all raw also map to
 //! plaintext byte runs of the `.pkg`.
 //!
@@ -81,7 +81,7 @@ struct Node {
     is_dir: bool,
     /// Mount offset of a file's data (0 for a directory or a CNT file).
     logical: u64,
-    /// The extents are valid (every block raw, or a CNT file); else reads decode.
+    /// The extents are valid (every block raw, or a CNT file); else use the mount reader.
     ext_ok: bool,
     ext_start: u32,
     ext_end: u32,
@@ -205,6 +205,10 @@ fn file_blocks(image: &pkg::Image, w: &tree::Walked, tmp: &mut Vec<Extent>, out:
         return Err(alloc::format!("{}: its data (mount {:#x}) does not start on a block boundary", w.path, w.logical));
     }
     for b in range {
+        if b.sparse() {
+            out.push(Block { raw_len: b.len, pkg_off: 0, stored_len: 0, compressed: false, desc: b.desc });
+            continue;
+        }
         tmp.clear();
         image.image.pkg_extents(b.stored_at, u64::from(b.stored_len), tmp).map_err(|e| alloc::format!("{}: {e}", w.path))?;
         let [run] = tmp.as_slice() else {
@@ -239,7 +243,8 @@ pub struct Extent {
 
 /// One Kraken block of a file: `raw_len` logical bytes, stored as `stored_len` contiguous bytes
 /// at `pkg_off` in the `.pkg`. A raw block's stored bytes are its logical bytes
-/// (`stored_len == raw_len`); a compressed one needs `kraken::decode_block`. Only a file's last
+/// (`stored_len == raw_len`); a compressed one needs `kraken::decode_block`. A sparse block has
+/// `stored_len == 0` and reads as zeros without consulting the package. Only a file's last
 /// block can extend past its end; the bytes beyond the file's size belong to no file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Block {
@@ -289,18 +294,18 @@ impl Pkg {
     }
 
     /// The plaintext byte runs of `e` inside the `.pkg`, in file order (empty for a directory).
-    /// `Unsupported` when one of its blocks is compressed.
+    /// `Unsupported` when one of its blocks is compressed or sparse.
     pub fn extents(&self, e: &Entry) -> Result<&[Extent], Error> {
         match self.file(e) {
             None => Ok(&[]),
             Some(n) if n.ext_ok => Ok(&self.extents[n.ext_start as usize..n.ext_end as usize]),
-            Some(_) => Err(pkg::unsupported(alloc::format!("{}: has Kraken-compressed blocks, no plaintext extents", e.path))),
+            Some(_) => Err(pkg::unsupported(alloc::format!("{}: has compressed or sparse blocks", e.path))),
         }
     }
 
     /// The Kraken blocks of `e`, consecutive, covering file bytes `[0, size)` in order (empty
     /// for a directory or an empty file). `Unsupported` when its data does not start on a block
-    /// boundary or a block's stored bytes are not one contiguous `.pkg` range.
+    /// boundary or a non-sparse block's stored bytes are not one contiguous `.pkg` range.
     pub fn blocks(&self, e: &Entry) -> Result<&[Block], Error> {
         match self.file(e) {
             None => Ok(&[]),

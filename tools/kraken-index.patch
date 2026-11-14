@@ -1,6 +1,13 @@
 --- a/src/ampr_index.rs
 +++ b/src/ampr_index.rs
-@@ -6,8 +6,9 @@
+@@ -1,13 +1,15 @@
+ //! Writes ampr_emu.index (AMPRIDX3) and ampr_assets.index (AMPRPAK4) so ampr-emu-ng serves the
+ //! .pkg as an LZ4-mode pack of RAW and KRAKEN chunks (one per Kraken block, ng/KRAKEN.md) from
+-//! one volume, the .pkg named in /app0/kraken.image (pack_id 0).
++//! the .pkg named in /app0/kraken.image (pack_id 0). A second volume holds shared zero bytes
++//! when a file uses sparse blocks.
+ //! Layouts follow ampr-emu-ng `ampr-format/src/index.rs`, `ampr-lz4/src/manifest.rs` (the
+ //! runtime runs the full `Manifest::open` on load) and the dump-forge writers
  //! (the vendored fpkg crate's `ampr_index.rs`, `ps5-dump-forge-lz4/src/writer.rs`).
  //! Manifest record i is AMPRIDX3 id i + 1, so both list the same files in the same sorted order.
  //! Directories are not records: the runtime derives them from the sorted file paths.
@@ -12,17 +19,32 @@
  
  pub struct IndexFile {
      /// Path under /app0 without a leading slash, e.g. "data/level1.bin".
-@@ -38,8 +39,6 @@
+@@ -25,7 +27,7 @@
+     pub pkg_off: u64,
+     pub stored_len: u32,
+     pub raw_len: u32,
+-    /// None: stored as plain bytes (stored_len == raw_len). Some: a compressed block.
++    /// None: plain bytes, or a sparse block when stored_len is zero. Some: a compressed block.
+     pub kraken: Option<Kraken>,
+ }
+ 
+@@ -38,8 +40,8 @@
  
  const APP0: &str = "/app0/";
  const PKG_NAME: &str = "kraken.pkg";
 -const INDEX_NAME: &str = "ampr_emu.index";
 -const MANIFEST_NAME: &str = "ampr_assets.index";
++const ZERO_PACK_NAME: &str = ".smp-kraken-zero.pak";
++const ZERO_PACK_ID: u32 = 1;
  
  // AMPRIDX3 (ampr-format index.rs, dump-forge's ampr_index.rs).
  const IDX_MAGIC: &[u8; 8] = b"AMPRIDX3";
-@@ -58,12 +57,10 @@
+@@ -56,14 +58,14 @@
+ const PACK_RECORD: usize = 32;
+ const PAK_PAYLOAD_CRC_AT: usize = 112;
  const PAK_HEADER_CRC_AT: usize = 116;
++const DAT_HEADER: usize = 64;
++const DAT_HEADER_CRC_AT: usize = 56;
  const ENDIAN_MARKER: u32 = 0x0102_0304;
  const FILE_PACKED: u32 = 1;
 -const FILE_STREAMING: u32 = 4;
@@ -34,7 +56,7 @@
  const CHUNK_PAGE_CONTAINED: u8 = 4;
  const CHUNK_PAGE_ALIGNED: u8 = 8;
  const PACK_IO_PAGE_LAYOUT: u32 = 2;
-@@ -77,8 +74,8 @@
+@@ -77,8 +79,8 @@
  const PATH_MAX: usize = 1024;
  const NAME_MAX: usize = 255;
  
@@ -45,7 +67,128 @@
  }
  
  fn folded(b: u8) -> u8 {
-@@ -324,7 +321,7 @@
+@@ -198,13 +200,20 @@
+     if blocks.len() as u64 != size.div_ceil(BLOCK) {
+         return Err(bad(format!("{path}: {} blocks for {size} bytes, want 256 KiB blocks", blocks.len())));
+     }
+-    let mut out = Vec::with_capacity(blocks.len());
++    let mut chunks = Vec::with_capacity(blocks.len());
+     for (i, c) in blocks.iter().enumerate() {
+         let (at, want) = (c.pkg_off, BLOCK.min(size - i as u64 * BLOCK));
+         let raw_len = u64::from(c.raw_len);
+         if raw_len < want || raw_len > BLOCK {
+             return Err(fail(at, "its length does not fit the 256 KiB block grid"));
+         }
++        if c.stored_len == 0 && c.kraken.is_none() {
++            // Every sparse chunk can read a prefix of the same page-aligned block of zeros.
++            let loc = (u64::from(ZERO_PACK_ID) << 48) | PAGE;
++            let flags = CHUNK_PAGE_ALIGNED | if want <= PAGE { CHUNK_PAGE_CONTAINED } else { 0 };
++            chunks.push((loc, (want as u32 - 1) | u32::from(flags) << 22));
++            continue;
++        }
+         let (stored, codec, mut flags, loc) = match c.kraken {
+             None => {
+                 if c.stored_len != c.raw_len {
+@@ -225,7 +234,7 @@
+                 (stored, CHUNK_KRAKEN, full, loc)
+             }
+         };
+-        let end = at + stored;
++        let end = at.checked_add(stored).ok_or_else(|| fail(at, "offset overflow"))?;
+         let limit = if codec == CHUNK_KRAKEN { KRAKEN_OFFSET_LIMIT } else { OFFSET_LIMIT };
+         if at < PAGE || end > vol_size || end >= limit {
+             return Err(fail(at, "outside the packable volume range"));
+@@ -236,16 +245,44 @@
+         // (ng/KRAKEN.md): the runtime reads the covering page window at any offset. Not marking
+         // files STREAMING keeps ng's decoded cache on for them (caches.rs refuses STREAMING).
+         flags |= if contained { CHUNK_PAGE_CONTAINED } else { 0 } | if aligned { CHUNK_PAGE_ALIGNED } else { 0 };
+-        out.push((loc, (stored as u32 - 1) | codec << 20, flags));
++        let desc = (stored as u32 - 1) | codec << 20 | u32::from(flags) << 22;
++        chunks.push((loc, desc));
+     }
+-    let chunks = out.into_iter().map(|(loc, d, f)| (loc, d | u32::from(f) << 22)).collect();
+     Ok(Plan { chunks, flags: FILE_PACKED })
+ }
+ 
+-/// AMPRPAK4 image: 128-byte header, file records, chunk records, one pack record, strings
+-/// (paths, then the volume name). `rows` pairs each sorted logical path with its file.
+-fn build_manifest(rows: &[(String, &IndexFile)], mtime: i64, pkg_len: u64) -> Result<Vec<u8>> {
++fn write_pack_record(record: &mut [u8], payload_len: u64, name_at: u32, name_len: u32) {
++    put64(record, 0, payload_len);
++    put64(record, 8, PAGE + payload_len);
++    put32(record, 16, name_at);
++    put32(record, 20, name_len);
++    put32(record, 24, PACK_IO_PAGE_LAYOUT);
++    put32(record, 28, PAGE as u32);
++}
++
++/// A regular AMPRDAT3 volume that supplies zeros for all sparse chunks.
++fn zero_volume(build_id: &[u8]) -> Vec<u8> {
++    let mut volume = vec![0; (PAGE + BLOCK) as usize];
++    let header = &mut volume[..DAT_HEADER];
++    header[..8].copy_from_slice(b"AMPRDAT3");
++    put32(header, 8, 3);
++    put32(header, 12, DAT_HEADER as u32);
++    put32(header, 16, ZERO_PACK_ID);
++    put32(header, 20, PACK_IO_PAGE_LAYOUT);
++    header[24..40].copy_from_slice(build_id);
++    put64(header, 40, PAGE);
++    put64(header, 48, BLOCK);
++    let checksum = crc32(&[header]);
++    put32(header, DAT_HEADER_CRC_AT, checksum);
++    volume
++}
++
++/// AMPRPAK4 image: header, file/chunk/pack records and strings.
++fn build_manifest(rows: &[(String, &IndexFile)], mtime: i64, pkg_len: u64) -> Result<(Vec<u8>, bool)> {
+     let vol_size = pkg_len.next_multiple_of(PAGE).max(2 * PAGE);
++    let has_sparse = rows.iter().any(|(_, file)| {
++        file.chunks.as_ref().is_some_and(|blocks| blocks.iter().any(|c| c.stored_len == 0))
++    });
+     let mut strings = Vec::new();
+     let mut add = |s: &str| {
+         let at = strings.len() as u32;
+@@ -274,14 +311,14 @@
+             chunks.extend_from_slice(&desc.to_le_bytes());
+         }
+     }
+-    let mut pack = vec![0u8; PACK_RECORD];
+-    put64(&mut pack, 0, vol_size - PAGE);
+-    put64(&mut pack, 8, vol_size);
++    let pack_count = 1 + usize::from(has_sparse);
++    let mut pack = vec![0u8; pack_count * PACK_RECORD];
+     let (at, len) = add(PKG_NAME);
+-    put32(&mut pack, 16, at);
+-    put32(&mut pack, 20, len);
+-    put32(&mut pack, 24, PACK_IO_PAGE_LAYOUT);
+-    put32(&mut pack, 28, PAGE as u32);
++    write_pack_record(&mut pack[..PACK_RECORD], vol_size - PAGE, at, len);
++    if has_sparse {
++        let (at, len) = add(ZERO_PACK_NAME);
++        write_pack_record(&mut pack[PACK_RECORD..], BLOCK, at, len);
++    }
+ 
+     let mut m = vec![0u8; PAK_HEADER];
+     m[..8].copy_from_slice(PAK_MAGIC);
+@@ -295,7 +332,7 @@
+     }
+     put64(&mut m, 40, rows.len() as u64);
+     put64(&mut m, 48, (chunks.len() / CHUNK_RECORD) as u64);
+-    put32(&mut m, 56, 1);
++    put32(&mut m, 56, pack_count as u32);
+     put32(&mut m, 60, FILE_RECORD as u32);
+     put32(&mut m, 64, CHUNK_RECORD as u32);
+     put32(&mut m, 68, PACK_RECORD as u32);
+@@ -315,7 +352,7 @@
+     put32(&mut m, PAK_PAYLOAD_CRC_AT, payload);
+     let header = crc32(&[&m[..PAK_HEADER_CRC_AT], &[0; 4], &m[PAK_HEADER_CRC_AT + 4..PAK_HEADER]]);
+     put32(&mut m, PAK_HEADER_CRC_AT, header);
+-    Ok(m)
++    Ok((m, has_sparse))
+ }
+ 
+ /// The AMPRIDX3 sort key: the folded path bytes (dump-forge's ampr_index.rs `key`).
+@@ -324,7 +361,7 @@
  }
  
  /// `logical_path` + `kernel_path_limits` of ampr-format, for a path without the /app0/ prefix.
@@ -54,7 +197,7 @@
      let full_len = APP0.len() + rel.len();
      let ok = !rel.is_empty()
          && full_len < PATH_MAX
-@@ -334,22 +331,8 @@
+@@ -334,22 +371,14 @@
      if ok { Ok(()) } else { Err(bad(format!("unindexable path {rel:?}"))) }
  }
  
@@ -74,20 +217,280 @@
 -        .ok()
 -        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
 -        .map_or(0, |d| d.as_secs() as i64);
-+/// Build the two index images. The caller writes them into an unpublished cache.
-+pub fn build(pkg_size: u64, mtime: i64, files: &[IndexFile]) -> Result<(Vec<u8>, Vec<u8>)> {
++pub struct IndexImages {
++    pub index: Vec<u8>,
++    pub manifest: Vec<u8>,
++    pub zero_pack: Option<(&'static str, Vec<u8>)>,
++}
++
++/// Build the metadata for an unpublished cache.
++pub fn build(pkg_size: u64, mtime: i64, files: &[IndexFile]) -> Result<IndexImages> {
      if files.is_empty() {
          return Err(bad("no files to index".into()));
      }
-@@ -366,8 +349,7 @@
+@@ -366,8 +395,8 @@
      }
      let idx_rows: Vec<(String, u64)> = rows.iter().map(|r| (r.1.clone(), r.2.size)).collect();
      let pak_rows: Vec<(String, &IndexFile)> = rows.into_iter().map(|r| (r.1, r.2)).collect();
 -    let manifest = build_manifest(&pak_rows, mtime, meta.len())?;
-+    let manifest = build_manifest(&pak_rows, mtime, pkg_size)?;
++    let (manifest, has_sparse) = build_manifest(&pak_rows, mtime, pkg_size)?;
      let index = build_index(&idx_rows, mtime);
 -    write_atomic(dir, MANIFEST_NAME, &manifest)?;
 -    write_atomic(dir, INDEX_NAME, &index)
--}
-+    Ok((index, manifest))
++    let zero_pack = has_sparse.then(|| (ZERO_PACK_NAME, zero_volume(&manifest[24..40])));
++    Ok(IndexImages { index, manifest, zero_pack })
+ }
+--- a/crates/kraken-mount-pkg/src/kraken.rs
++++ b/crates/kraken-mount-pkg/src/kraken.rs
+@@ -1,7 +1,7 @@
+ //! The Kraken layout descriptor (`naps_pkg_layout.dat`), walked in chunks into a compact block
+ //! list. Port of `VF/kraken_image.rs:728-1036` (`describe`) and `FP/mount.rs:35-283` (`KBlock`,
+-//! `Kraken::new`, `stored`). Blocks may be raw or Kraken-compressed; byte shuffles and sparse
+-//! extents are refused.
++//! `Kraken::new`, `stored`). Blocks may be raw, Kraken-compressed or sparse;
++//! byte shuffles are refused.
+ 
+ use alloc::format;
+ use alloc::vec;
+@@ -36,6 +36,10 @@
+ }
+ 
+ impl KBlock {
++    pub fn sparse(&self) -> bool {
++        self.stored_len == 0
++    }
++
+     /// Stored as a plain copy of its logical bytes (no decoding needed).
+     pub fn raw(&self) -> bool {
+         self.stored_len == self.len
+@@ -50,6 +54,38 @@
+     pub mount_size: u64,
+ }
+ 
++struct Boundaries {
++    offsets: Vec<u64>,
++    sparse: Vec<u64>,
++    mount: u64,
 +}
++
++impl Boundaries {
++    fn next(&self, offset: u64) -> u64 {
++        let index = self.offsets.partition_point(|&end| end <= offset);
++        self.offsets.get(index).copied().unwrap_or(self.mount)
++    }
++
++    // Kind 0x40 marks a zero-filled span up to the next boundary, as in Dump Forge.
++    // It consumes no stored bytes and has no record in the block stream.
++    fn append_sparse(&self, logical: &mut u64, blocks: &mut Vec<KBlock>) {
++        while self.sparse.binary_search(logical).is_ok() {
++            let end = self.next(*logical);
++            while *logical < end {
++                let len = (end - *logical).min(UBLOCK);
++                blocks.push(KBlock {
++                    logical: *logical,
++                    stored_at: 0,
++                    len: len as u32,
++                    stored_len: 0,
++                    desc: Desc { even_len: 0, mode: 0 },
++                });
++                *logical += len;
++            }
++        }
++    }
++}
++
+ /// The descriptor's 9-byte records, read `CHUNK` at a time. Lookups move forward and look at
+ /// most two records ahead, so a reload starts two records back.
+ struct Records<'a, R: PRead> {
+@@ -144,10 +180,8 @@
+         if naps.size < (rec_at + records * 9) as u64 {
+             return Err(corrupt("layout descriptor shorter than its records"));
+         }
+-        let (bounds, mount) = boundaries(io, naps, fidx_at, files, ublocks)?;
+-        let next_bound = |x: u64| {
+-            bounds.get(bounds.partition_point(|&b| b <= x)).copied().unwrap_or(mount)
+-        };
++        let bounds = boundaries(io, naps, fidx_at, files, ublocks)?;
++        let mount = bounds.mount;
+         let mut tag = [0u8; 3];
+         naps.read(io, (rec_at - 3) as u64, &mut tag)?;
+         let strict = tag == [0x00, 0x00, 0x04];
+@@ -170,6 +204,7 @@
+                 }
+                 continue;
+             }
++            bounds.append_sparse(&mut logical, &mut blocks);
+             if strict && i > 0 && nibble != logical & 0xF {
+                 return Err(corrupt(format!("record {i}: the exact start's low nibble disagrees")));
+             }
+@@ -179,7 +214,7 @@
+             if (logical % WINDOW) >> 4 != f(0, 14) {
+                 return Err(corrupt(format!("record {i}: logical offset disagrees")));
+             }
+-            let cap = logical + (next_bound(logical).min(mount) - logical).min(UBLOCK);
++            let cap = logical + (bounds.next(logical) - logical).min(UBLOCK);
+             let next = if f(66, 1) == 1 { i + 2 } else { i + 1 };
+             let len = if next + 1 < records {
+                 let at16 = (logical & !(WINDOW - 1)) | ((rec.get(next)? as u64 & 0x3FFF) << 4);
+@@ -219,6 +254,7 @@
+             cursor = end;
+             logical += len;
+         }
++        bounds.append_sparse(&mut logical, &mut blocks);
+         if logical != mount {
+             return Err(corrupt(format!("blocks tile to {logical:#x}, the mount is {mount:#x}")));
+         }
+@@ -228,17 +264,16 @@
+ }
+ 
+ /// The descriptor's boundary table (`fidx`, 6 B per entry: 40-bit mount offset, kind byte),
+-/// read in chunks: the sorted, deduplicated boundaries and the mount's end (the last entry).
+-/// A kind-0x40 boundary before the end opens a sparse extent, which this MVP refuses.
++/// read in chunks. The final entry is the mount end and is never a sparse extent.
+ fn boundaries<R: PRead>(
+     io: &R,
+     naps: &OuterFile,
+     fidx_at: usize,
+     files: usize,
+     ublocks: u64,
+-) -> Result<(Vec<u64>, u64), Error> {
+-    let mut bounds = Vec::with_capacity(files);
+-    let mut sparse_at: Option<u64> = None;
++) -> Result<Boundaries, Error> {
++    let mut offsets = Vec::with_capacity(files);
++    let mut sparse = Vec::new();
+     let mut buf = vec![0u8; CHUNK * 6];
+     let mut done = 0usize;
+     while done < files {
+@@ -248,22 +283,21 @@
+         for r in chunk.chunks_exact(6) {
+             let off = u64::from_le_bytes([r[0], r[1], r[2], r[3], r[4], 0, 0, 0]);
+             if r[5] == 0x40 {
+-                sparse_at = Some(sparse_at.map_or(off, |a: u64| a.min(off)));
++                sparse.push(off);
+             }
+-            bounds.push(off);
++            offsets.push(off);
+         }
+         done += n;
+     }
+-    let mount = bounds.last().copied().unwrap_or(0);
+-    if mount.div_ceil(UBLOCK) != ublocks || bounds.iter().any(|&b| b > mount) {
++    let mount = offsets.last().copied().unwrap_or(0);
++    if mount.div_ceil(UBLOCK) != ublocks || offsets.iter().any(|&b| b > mount) {
+         return Err(corrupt("the boundary table disagrees with the mount's size"));
+     }
+-    // The mount's end carries kind 0x40 too; only one before it is a hole.
+-    if let Some(at) = sparse_at.filter(|&a| a < mount) {
+-        return Err(unsupported(format!("the layout has a sparse extent at mount {at:#x}; {REPACK}")));
+-    }
+-    bounds.sort_unstable();
+-    bounds.dedup();
+-    bounds.shrink_to_fit();
+-    Ok((bounds, mount))
++    offsets.sort_unstable();
++    offsets.dedup();
++    offsets.shrink_to_fit();
++    sparse.retain(|&start| start < mount);
++    sparse.sort_unstable();
++    sparse.dedup();
++    Ok(Boundaries { offsets, sparse, mount })
+ }
+--- a/crates/kraken-mount-pkg/src/lib.rs
++++ b/crates/kraken-mount-pkg/src/lib.rs
+@@ -1,5 +1,5 @@
+ //! Read a ps5-dump-forge debug FPKG (`.pkg`) in place: plaintext (`PPRPLAIN-NOAUTH!`), Kraken
+-//! layout at any level (`stored` or Kraken-compressed blocks, no byte shuffles), no LIH patch.
++//! layout with stored, Kraken-compressed or sparse blocks, without byte shuffles or LIH patches.
+ //! Every file maps to a list of Kraken blocks; files whose blocks are all raw also map to
+ //! plaintext byte runs of the `.pkg`.
+ //!
+@@ -81,7 +81,7 @@
+     is_dir: bool,
+     /// Mount offset of a file's data (0 for a directory or a CNT file).
+     logical: u64,
+-    /// The extents are valid (every block raw, or a CNT file); else reads decode.
++    /// The extents are valid (every block raw, or a CNT file); else use the mount reader.
+     ext_ok: bool,
+     ext_start: u32,
+     ext_end: u32,
+@@ -205,6 +205,10 @@
+         return Err(alloc::format!("{}: its data (mount {:#x}) does not start on a block boundary", w.path, w.logical));
+     }
+     for b in range {
++        if b.sparse() {
++            out.push(Block { raw_len: b.len, pkg_off: 0, stored_len: 0, compressed: false, desc: b.desc });
++            continue;
++        }
+         tmp.clear();
+         image.image.pkg_extents(b.stored_at, u64::from(b.stored_len), tmp).map_err(|e| alloc::format!("{}: {e}", w.path))?;
+         let [run] = tmp.as_slice() else {
+@@ -239,7 +243,8 @@
+ 
+ /// One Kraken block of a file: `raw_len` logical bytes, stored as `stored_len` contiguous bytes
+ /// at `pkg_off` in the `.pkg`. A raw block's stored bytes are its logical bytes
+-/// (`stored_len == raw_len`); a compressed one needs `kraken::decode_block`. Only a file's last
++/// (`stored_len == raw_len`); a compressed one needs `kraken::decode_block`. A sparse block has
++/// `stored_len == 0` and reads as zeros without consulting the package. Only a file's last
+ /// block can extend past its end; the bytes beyond the file's size belong to no file.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub struct Block {
+@@ -289,18 +294,18 @@
+     }
+ 
+     /// The plaintext byte runs of `e` inside the `.pkg`, in file order (empty for a directory).
+-    /// `Unsupported` when one of its blocks is compressed.
++    /// `Unsupported` when one of its blocks is compressed or sparse.
+     pub fn extents(&self, e: &Entry) -> Result<&[Extent], Error> {
+         match self.file(e) {
+             None => Ok(&[]),
+             Some(n) if n.ext_ok => Ok(&self.extents[n.ext_start as usize..n.ext_end as usize]),
+-            Some(_) => Err(pkg::unsupported(alloc::format!("{}: has Kraken-compressed blocks, no plaintext extents", e.path))),
++            Some(_) => Err(pkg::unsupported(alloc::format!("{}: has compressed or sparse blocks", e.path))),
+         }
+     }
+ 
+     /// The Kraken blocks of `e`, consecutive, covering file bytes `[0, size)` in order (empty
+     /// for a directory or an empty file). `Unsupported` when its data does not start on a block
+-    /// boundary or a block's stored bytes are not one contiguous `.pkg` range.
++    /// boundary or a non-sparse block's stored bytes are not one contiguous `.pkg` range.
+     pub fn blocks(&self, e: &Entry) -> Result<&[Block], Error> {
+         match self.file(e) {
+             None => Ok(&[]),
+--- a/crates/kraken-mount-pkg/src/pkg.rs
++++ b/crates/kraken-mount-pkg/src/pkg.rs
+@@ -264,11 +264,11 @@
+ 
+     /// Append the `.pkg` byte runs behind mount bytes `off..off + len` to `out`, in order,
+     /// merging a run into the previous one (also one already in `out`) when they touch.
+-    /// `Unsupported` when a block in the range is compressed (its bytes are not plaintext).
++    /// `Unsupported` when a block in the range is compressed or sparse.
+     pub fn extents(&self, off: u64, len: u64, out: &mut Vec<Extent>) -> Result<(), Error> {
+         self.check_range(off, len)?;
+         if let Some(b) = self.kraken.range(off, len).iter().find(|b| !b.raw()) {
+-            return Err(unsupported(format!("the block at mount {:#x} is Kraken-compressed", b.logical)));
++            return Err(unsupported(format!("the block at mount {:#x} has no plaintext extent", b.logical)));
+         }
+         for (at, n) in self.kraken.stored(off, len) {
+             self.image.pkg_extents(at, n, out)?;
+@@ -299,8 +299,7 @@
+         Ok(())
+     }
+ 
+-    /// Exactly `buf.len()` mount bytes at `off`: raw blocks are read in place, compressed ones
+-    /// decoded through `dec`.
++    /// Exactly `buf.len()` mount bytes at `off`. Sparse blocks read as zeros.
+     pub fn read_mount<R: PRead>(&self, io: &R, off: u64, buf: &mut [u8], dec: &mut Decoder) -> Result<(), Error> {
+         #[cfg(feature = "probe")]
+         if let Some(m) = &self.probe_mount {
+@@ -316,7 +315,9 @@
+             let inner = (off + done as u64 - b.logical) as usize;
+             let n = (b.len as usize - inner).min(buf.len() - done);
+             let out = &mut buf[done..done + n];
+-            if b.raw() {
++            if b.sparse() {
++                out.fill(0);
++            } else if b.raw() {
+                 runs.clear();
+                 self.image.pkg_extents(b.stored_at + inner as u64, n as u64, &mut runs)?;
+                 let mut at = 0usize;

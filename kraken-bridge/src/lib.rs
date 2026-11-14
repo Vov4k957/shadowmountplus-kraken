@@ -1,5 +1,5 @@
 //! Adapts Kraken Mount's plaintext package reader and index writer to SMP.
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
 
@@ -8,20 +8,25 @@ mod ampr_index;
 
 use alloc::{collections::BTreeMap, format, string::String, vec, vec::Vec};
 use ampr_index::{Chunk, IndexFile, Kraken};
-use core::{alloc::{GlobalAlloc, Layout}, ffi::c_void, panic::PanicInfo, ptr, slice, str};
+use core::{ffi::c_void, ptr, slice, str};
+#[cfg(not(test))]
+use core::{alloc::{GlobalAlloc, Layout}, panic::PanicInfo};
 use kraken_mount_pkg::{Entry, PRead, Pkg};
 
 const COPY_BUFFER: usize = 1024 * 1024;
 const REQUIRED_FILES: [&str; 3] = ["eboot.bin", "sce_sys/param.json", "sce_sys/icon0.png"];
 
+#[cfg(not(test))]
 extern "C" {
     fn posix_memalign(out: *mut *mut u8, alignment: usize, size: usize) -> i32;
     fn free(ptr: *mut u8);
     fn abort() -> !;
 }
 
+#[cfg(not(test))]
 struct Allocator;
 
+#[cfg(not(test))]
 unsafe impl GlobalAlloc for Allocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let mut result = ptr::null_mut();
@@ -37,9 +42,11 @@ unsafe impl GlobalAlloc for Allocator {
     }
 }
 
+#[cfg(not(test))]
 #[global_allocator]
 static ALLOCATOR: Allocator = Allocator;
 
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! {
     unsafe { abort() }
@@ -47,10 +54,15 @@ fn panic(_info: &PanicInfo<'_>) -> ! {
 
 // The prebuilt core references this symbol in its unwind metadata.
 // The bridge uses panic=abort and never unwinds across the C boundary.
+#[cfg(not(test))]
 #[no_mangle]
 extern "C" fn rust_eh_personality() -> ! {
     unsafe { abort() }
 }
+
+#[cfg(test)]
+#[path = "sparse_tests.rs"]
+mod sparse_tests;
 
 type Read = unsafe extern "C" fn(*mut c_void, u64, *mut u8, usize) -> isize;
 type Write = unsafe extern "C" fn(*mut c_void, *const u8, usize, u64, *const u8, usize) -> i32;
@@ -168,9 +180,12 @@ fn prepare(io: &PackageIo, size: u64, mtime: i64, basename: &str) -> Result<(), 
         files.insert(lower, IndexFile { path: String::from(entry.path), size: length, chunks });
     }
     let files: Vec<_> = files.into_values().collect();
-    let (index, manifest) = ampr_index::build(size, mtime, &files)?;
-    io.output("ampr_emu.index", 0, &index)?;
-    io.output("ampr_assets.index", 0, &manifest)?;
+    let images = ampr_index::build(size, mtime, &files)?;
+    if let Some((name, bytes)) = images.zero_pack {
+        io.output(name, 0, &bytes)?;
+    }
+    io.output("ampr_emu.index", 0, &images.index)?;
+    io.output("ampr_assets.index", 0, &images.manifest)?;
     io.output("kraken.image", 0, format!("kraken/{basename}").as_bytes())
 }
 
