@@ -571,12 +571,8 @@ static void remove_staging(const char *path) {
 
 static bool publish_cache(const char *title_id, const char *staging,
                           const char *cache, const char *backup) {
-  if (cancelled(NULL) || !sm_shellcore_try_begin_external_mutation()) {
-    errno = EBUSY;
-    return false;
-  }
-  if (sm_shellcore_title_is_protected(title_id)) {
-    sm_shellcore_end_external_mutation();
+  // The full scan already holds the external mutation guard through registration.
+  if (cancelled(NULL) || sm_shellcore_title_is_protected(title_id)) {
     errno = EBUSY;
     return false;
   }
@@ -603,7 +599,6 @@ static bool publish_cache(const char *title_id, const char *staging,
   }
   int error = ready ? 0 : errno;
   runtime_mount_state_unlock();
-  sm_shellcore_end_external_mutation();
   errno = error;
   return ready;
 }

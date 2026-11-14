@@ -14,6 +14,7 @@ bool sm_kraken_is_cache(const char *path);
 // Header check only. The full parser runs when the scanner prepares a cache.
 bool sm_kraken_can_mount(const sm_pkg_info_t *info);
 // Reuse a matching cache or build a complete new cache before publishing it.
+// The caller must hold the scanner's external mutation guard.
 bool sm_kraken_prepare(const sm_pkg_info_t *info, char cache[MAX_PATH]);
 // Read the backing package path from an SMP Kraken cache, even if it is offline.
 bool sm_kraken_source(const char *cache, char path[MAX_PATH]);

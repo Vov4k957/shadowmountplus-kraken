@@ -12,6 +12,7 @@ static bool fail_unmount, sleeping, kraken_title, package_missing;
 static void sm_scanner_wake(void) { ++wakes; }
 static void log_debug(const char *format, ...) { (void)format; }
 static bool sm_game_lifecycle_has_active_game(void) { return false; }
+static bool should_stop_requested(void) { return false; }
 static bool runtime_sleep_mode_active(void) { return sleeping; }
 static uint64_t monotonic_time_us(void) { return 100000000; }
 static bool shellcore_service_stopping(void) { return false; }
@@ -70,6 +71,33 @@ static void sm_pkg_backport_on_launch_failed(const char *title) { (void)title; }
 
 #include "launch_helpers.inc"
 
+static bool preserve_game_written_files(const char *cache, const char *staging) {
+  (void)cache;
+  (void)staging;
+  assert(false); // This test publishes a new cache or defers an active title.
+  return false;
+}
+
+#include "kraken_publish.inc"
+
+static pthread_mutex_t g_scanner_cycle_mutex = PTHREAD_MUTEX_INITIALIZER;
+static char kraken_staging[MAX_PATH], kraken_cache[MAX_PATH], kraken_backup[MAX_PATH];
+static bool kraken_published;
+
+static bool sm_shellcore_background_work_blocked(void) { return false; }
+
+static bool run_full_scan_cycle_impl(bool startup, const char *reason, bool *unstable) {
+  (void)startup;
+  (void)reason;
+  (void)unstable;
+  assert(g_service.external_mutation_in_progress);
+  kraken_published = publish_cache(TITLE_A, kraken_staging, kraken_cache, kraken_backup);
+  assert(g_service.external_mutation_in_progress);
+  return true;
+}
+
+#include "scan_cycle.inc"
+
 static void reset_state(void) {
   clear_mount_owner(&g_service.prepared);
   clear_mount_owner(&g_service.outgoing);
@@ -99,7 +127,29 @@ static void abandon_switch(void) {
   unmounts = 0;
 }
 
-int main(void) {
+static void test_kraken_publication(const char *directory) {
+  reset_state();
+  snprintf(kraken_staging, sizeof(kraken_staging), "%s/kraken-staging", directory);
+  snprintf(kraken_cache, sizeof(kraken_cache), "%s/kraken-cache", directory);
+  snprintf(kraken_backup, sizeof(kraken_backup), "%s/kraken-backup", directory);
+  assert(mkdir(kraken_staging, 0700) == 0);
+  assert(run_full_scan_cycle(false, NULL, NULL));
+  assert(kraken_published && !g_service.external_mutation_in_progress);
+  assert(access(kraken_cache, F_OK) == 0 && access(kraken_staging, F_OK) != 0);
+
+  assert(mkdir(kraken_staging, 0700) == 0);
+  start_title(TITLE_A, 0x18, 173);
+  unsigned before = unmounts;
+  assert(run_full_scan_cycle(false, NULL, NULL));
+  assert(!kraken_published && errno == EBUSY && unmounts == before);
+  assert(!g_service.external_mutation_in_progress);
+  assert(access(kraken_cache, F_OK) == 0 && access(kraken_staging, F_OK) == 0);
+  puts("Kraken cache: scanner-owned publication and active-title protection passed");
+}
+
+int main(int argc, char **argv) {
+  assert(argc == 2);
+  test_kraken_publication(argv[1]);
   reset_state();
   kraken_title = package_missing = true;
   assert(mount_managed_title_runtime(TITLE_A, true, false, NULL) == ENOENT);
