@@ -1,0 +1,16 @@
+[package]
+name = "smp-kraken-bridge"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+kraken-mount-pkg = { path = "../vendor/kraken/crates/kraken-mount-pkg" }
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true

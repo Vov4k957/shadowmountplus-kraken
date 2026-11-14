@@ -7,7 +7,7 @@
 #define TITLE_C "PPSA99008"
 
 static unsigned wakes, unmounts;
-static bool fail_unmount, sleeping;
+static bool fail_unmount, sleeping, kraken_title, package_missing;
 
 static void sm_scanner_wake(void) { ++wakes; }
 static void log_debug(const char *format, ...) { (void)format; }
@@ -26,6 +26,17 @@ static bool read_mount_link(const char *title, char *path, size_t size) {
 }
 static bool is_under_image_mount_base(const char *path) {
   (void)path; return false;
+}
+static bool sm_kraken_is_cache(const char *path) {
+  (void)path; return kraken_title;
+}
+static bool sm_kraken_source_ready(const char *path) {
+  (void)path;
+  if (package_missing) {
+    errno = ENOENT;
+    return false;
+  }
+  return true;
 }
 static bool wait_for_resumed_runtime_source(const char *title, char *path) {
   (void)title; (void)path; return true;
@@ -66,6 +77,7 @@ static void reset_state(void) {
   g_service.external_mutation_in_progress = false;
   g_service.pending_launch_title_id[0] = g_service.releasing_title_id[0] = '\0';
   fail_unmount = sleeping = false;
+  kraken_title = package_missing = false;
   wakes = unmounts = 0;
 }
 
@@ -88,6 +100,13 @@ static void abandon_switch(void) {
 }
 
 int main(void) {
+  reset_state();
+  kraken_title = package_missing = true;
+  assert(mount_managed_title_runtime(TITLE_A, true, false, NULL) == ENOENT);
+  assert(!launch_preparation_pending_locked() && unmounts == 0);
+  package_missing = false;
+  start_title(TITLE_A, 0x18, 173);
+
   abandon_switch();
   unsigned before = wakes;
   assert(handle_launch_request(TITLE_C) == 0);

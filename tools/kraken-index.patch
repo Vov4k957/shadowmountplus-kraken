@@ -1,0 +1,93 @@
+--- a/src/ampr_index.rs
++++ b/src/ampr_index.rs
+@@ -6,8 +6,9 @@
+ //! (the vendored fpkg crate's `ampr_index.rs`, `ps5-dump-forge-lz4/src/writer.rs`).
+ //! Manifest record i is AMPRIDX3 id i + 1, so both list the same files in the same sorted order.
+ //! Directories are not records: the runtime derives them from the sorted file paths.
+-use std::io::{Error, ErrorKind, Result};
+-use std::path::Path;
++use alloc::{format, string::String, vec, vec::Vec};
++
++type Result<T> = core::result::Result<T, String>;
+ 
+ pub struct IndexFile {
+     /// Path under /app0 without a leading slash, e.g. "data/level1.bin".
+@@ -38,8 +39,6 @@
+ 
+ const APP0: &str = "/app0/";
+ const PKG_NAME: &str = "kraken.pkg";
+-const INDEX_NAME: &str = "ampr_emu.index";
+-const MANIFEST_NAME: &str = "ampr_assets.index";
+ 
+ // AMPRIDX3 (ampr-format index.rs, dump-forge's ampr_index.rs).
+ const IDX_MAGIC: &[u8; 8] = b"AMPRIDX3";
+@@ -58,12 +57,10 @@
+ const PAK_HEADER_CRC_AT: usize = 116;
+ const ENDIAN_MARKER: u32 = 0x0102_0304;
+ const FILE_PACKED: u32 = 1;
+-const FILE_STREAMING: u32 = 4;
+ const CHUNK_RAW: u32 = 0;
+ /// ng/KRAKEN.md: codec 2, location = offset (40 bits) | even_len << 40 | mode << 59.
+ const CHUNK_KRAKEN: u32 = 2;
+ const CHUNK_KRAKEN_FULL: u8 = 0x10;
+-const CHUNK_STREAMING: u8 = 2;
+ const CHUNK_PAGE_CONTAINED: u8 = 4;
+ const CHUNK_PAGE_ALIGNED: u8 = 8;
+ const PACK_IO_PAGE_LAYOUT: u32 = 2;
+@@ -77,8 +74,8 @@
+ const PATH_MAX: usize = 1024;
+ const NAME_MAX: usize = 255;
+ 
+-fn bad(msg: String) -> Error {
+-    Error::new(ErrorKind::InvalidData, msg)
++fn bad(msg: String) -> String {
++    msg
+ }
+ 
+ fn folded(b: u8) -> u8 {
+@@ -324,7 +321,7 @@
+ }
+ 
+ /// `logical_path` + `kernel_path_limits` of ampr-format, for a path without the /app0/ prefix.
+-fn check_path(rel: &str) -> Result<()> {
++pub(crate) fn check_path(rel: &str) -> Result<()> {
+     let full_len = APP0.len() + rel.len();
+     let ok = !rel.is_empty()
+         && full_len < PATH_MAX
+@@ -334,22 +331,8 @@
+     if ok { Ok(()) } else { Err(bad(format!("unindexable path {rel:?}"))) }
+ }
+ 
+-fn write_atomic(dir: &Path, name: &str, data: &[u8]) -> Result<()> {
+-    let tmp = dir.join(format!("{name}.tmp"));
+-    std::fs::write(&tmp, data)?;
+-    std::fs::rename(&tmp, dir.join(name))
+-}
+-
+-/// Writes both index files into `dir` (the game's cache dir, seen as /app0).
+-/// `pkg` is the .pkg (ng opens the path in /app0/kraken.image): its size bounds the volume and its mtime goes in
+-/// every record.
+-pub fn write(dir: &Path, pkg: &Path, files: &[IndexFile]) -> std::io::Result<()> {
+-    let meta = std::fs::metadata(pkg)?;
+-    let mtime = meta
+-        .modified()
+-        .ok()
+-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+-        .map_or(0, |d| d.as_secs() as i64);
++/// Build the two index images. The caller writes them into an unpublished cache.
++pub fn build(pkg_size: u64, mtime: i64, files: &[IndexFile]) -> Result<(Vec<u8>, Vec<u8>)> {
+     if files.is_empty() {
+         return Err(bad("no files to index".into()));
+     }
+@@ -366,8 +349,7 @@
+     }
+     let idx_rows: Vec<(String, u64)> = rows.iter().map(|r| (r.1.clone(), r.2.size)).collect();
+     let pak_rows: Vec<(String, &IndexFile)> = rows.into_iter().map(|r| (r.1, r.2)).collect();
+-    let manifest = build_manifest(&pak_rows, mtime, meta.len())?;
++    let manifest = build_manifest(&pak_rows, mtime, pkg_size)?;
+     let index = build_index(&idx_rows, mtime);
+-    write_atomic(dir, MANIFEST_NAME, &manifest)?;
+-    write_atomic(dir, INDEX_NAME, &index)
+-}
++    Ok((index, manifest))
++}

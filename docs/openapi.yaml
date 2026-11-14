@@ -1072,6 +1072,37 @@ paths:
         "409":
           $ref: "#/components/responses/Busy"
 
+  /api/v1/packages/mount:
+    post:
+      operationId: mountDebugPackage
+      summary: Register a native plaintext PS5 debug base-game package for Kraken mounting
+      tags: [Packages]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path]
+              properties:
+                path: {type: string, example: /mnt/usb0/packages/game.pkg}
+      responses:
+        "202":
+          description: Added to the manual source list and a scan was requested
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, title_id, changed]
+                properties:
+                  status: {type: integer, enum: [0]}
+                  title_id: {type: string}
+                  changed: {type: boolean, description: The source was new to the manual list}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          description: A different source already owns the Title ID
+
   /api/v1/sources/install:
     post:
       operationId: installGameSource
@@ -2722,6 +2753,7 @@ components:
               sdk_version: {type: integer, minimum: 0, maximum: 4294967295, description: Packed SDK from param.json/param.sfo for PKGs and game directories or the backport eboot.bin process parameter; zero when unavailable.}
               kind: {type: string, enum: [base, patch, dlc, unknown]}
               installed: {type: boolean, description: The base game is already installed as a native PKG.}
+              mountable: {type: boolean, description: The local base-game package has a plaintext PS5 debug header. The scanner performs full validation.}
               replaceable: {type: boolean, description: Full media application remaster that can replace an existing native app.}
               base_installed: {type: boolean, description: A base game is registered from a PKG or a folder/image source.}
               base_queued: {type: boolean}

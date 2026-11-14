@@ -1,8 +1,8 @@
-# ShadowMountPlus (PS5)
+# ShadowMountPlus with Kraken Mount (PS5)
 
 **ShadowMountPlus** is an automated background game mounter and library manager for jailbroken PlayStation 5 consoles. It discovers and registers PS4/PS5 game folders and supported disk images on internal or external storage, then prepares them when launched. A built-in web interface provides library management, installation, file transfers, and configuration.
 
-**[Download releases](https://github.com/drakmor/ShadowMountPlus/releases)** · **[Discord community](https://discord.gg/x2Ppvzwjhm)** · **[Report an issue](https://github.com/drakmor/ShadowMountPlus/issues)**
+**[Upstream ShadowMountPlus](https://github.com/drakmor/ShadowMountPlus)** · **[Kraken Mount](https://github.com/quer3q/kraken-mount)** · **[Discord community](https://discord.gg/x2Ppvzwjhm)**
 
 > [!WARNING]
 > Mounting disk images can cause shutdown issues or data corruption, particularly on older firmware. Back up important files and saves before testing. This project requires a jailbroken PS5 and is not intended for an unmodified console.
@@ -38,7 +38,7 @@ Please double-check the currency and network before sending a donation.
 ## Requirements
 
 - Jailbroken PlayStation 5 with **[kstuff-lite v1.07 or newer](https://github.com/EchoStretch/kstuff-lite)** (including supported firmware 2.00 configurations).
-- The latest compatible `shadowmountplus.elf` from [Releases](https://github.com/drakmor/ShadowMountPlus/releases).
+- `shadowmountplus.elf` built from this fork.
 - A payload sender or a compatible autoloader.
 
 ## Quick start
@@ -82,6 +82,7 @@ http://<PS5_IP>:10101
 | `.ffpfs` | PFS disk image | Supported |
 | `.ffpfsc` | Compressed PFS container holding another supported image | Supported; compression can affect loading performance |
 | Game folder | Extracted game files | Supported in scanned or manually specified paths |
+| `.pkg` | Plaintext PS5 debug base-game package | Use **Installation → Mount .pkg** for a compatible local package |
 
 **Choose `.ffpkg` for general use.** Use `.exfat` when a game needs external-drive compatibility; create it with a **64 KB allocation unit**. Compressed `.ffpfsc` containers are best reserved for games without demanding continuous data streaming.
 
@@ -181,6 +182,8 @@ Open **Installation** to browse available PS5 storage, USB/external drives, and 
 
 - **Install from a folder or image:** select a supported PS4/PS5 game folder or `.ffpkg`, `.exfat`, `.ffpfs`, or `.ffpfsc` image, choose a local console destination, and start the installation. ShadowMountPlus copies the source and registers the copied game; the original source is retained.
 - **Install PKG files:** install base games, game updates (patches), or DLC packages from console storage, external drives, or an SMB share. The required base game must be present or included in the installation workflow.
+- **Mount a debug PS5 package:** select **Mount .pkg** next to a compatible plaintext debug base-game package on local console storage, M.2, or USB storage. SMP registers the game in the PS5 menu and reads game assets from that file. Keep the original `.pkg` in place while the game is registered. SMP stores launch files and the asset index under `/data/shadowmount/kraken/<TitleID>`. This experimental feature uses Kraken Mount's reader and its bundled AMPR-emu-ng runtime inside `shadowmountplus.elf`. Mounting an additional source for a registered Title ID requires first removing the previous registration. Only the base package is supported in this mode.
+- **Remove a mounted package from the library:** use **Uninstall** from the SMP library to remove the registration. The source `.pkg` and cache remain available for mounting again.
 - **Install directly from a PC browser:** select PKG files on your computer and send them to the PS5 installer without first manually copying the complete packages to console storage. **Keep the browser page open until streaming completes.**
 - **Use the installation queue:** collect up to 32 PKGs from supported sources and follow installation progress. PC batches can be ordered automatically as **base game → update → DLC**, so dependent content is installed in the correct sequence. Queued files are not removed from their source storage merely because they have been installed.
 - **Manage files and destinations:** copy or move supported game sources, choose a writable destination, create a folder where permitted, and delete eligible files from the Installation browser with confirmation.
@@ -387,9 +390,22 @@ Debug logging is enabled by default. You can change it with `[general] debug = o
 - [API documentation](docs/api.md) — web/API endpoints and integration reference.
 - [Releases](https://github.com/drakmor/ShadowMountPlus/releases) — downloads and release notes.
 
+## Updating the upstream projects
+
+Run these commands from a clean checkout. An SMP update merges the source history. A Kraken update imports the specified release's package reader, index writer and matching AMPR runtime, checks the runtime checksum, and reapplies the SMP adaptation in `tools/kraken-index.patch`. Review any merge conflict or patch failure before continuing. Build and test the result before committing the Kraken update or publishing either update.
+
+```bash
+bash tools/sync-upstream.sh smp
+bash tools/sync-upstream.sh kraken v0.0.1-beta
+```
+
+Replace `v0.0.1-beta` with the Kraken release tag you want to test. The imported commit is recorded in `vendor/kraken/REVISION`. The PS5 build uses the vendored version so that a release rebuild selects the same reader and runtime.
+
 ## Credits
 
 **Drakmor** — development and evolution of ShadowMount into ShadowMountPlus.
+
+**quer3q** — [Kraken Mount](https://github.com/quer3q/kraken-mount) package reader and index writer and [AMPR-emu-ng](https://github.com/quer3q/ampr-emu-ng) runtime. See [the vendored notices](vendor/kraken/THIRD_PARTY_NOTICES) for attribution and license details.
 
 Special thanks to **VoidWhisper** (original ShadowMount), **BestPig** (BackPort), **EchoStretch**, **Gezine**, **earthonion**, **LightningMods**, **RenanGBarreto** ([MkPFS](https://github.com/PSBrew/MkPFS)), **john-tornblom** (SDK), and the **PS5 R&D community**.
 

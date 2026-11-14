@@ -516,6 +516,13 @@ installed standalone or queued even when the native app is installed. The
 worker follows ShellCore's patch task when replacing an existing native app,
 including patch progress and cancellation without uninstalling that base.
 
+A local plaintext PS5 debug base-game PKG may also have `mountable=true`.
+`POST /api/v1/packages/mount` accepts `{"path":"/mnt/usb0/packages/game.pkg"}` and
+returns HTTP 202 with `status`, `title_id` and `changed`. The scanner validates
+the package and registers it from its current path. An unsupported package
+returns HTTP 400, and a different source already registered for the Title ID
+returns HTTP 409.
+
 `GET /api/v1/packages/icon?path=...&v=...` returns the embedded icon0.png from a
 permitted PKG, limited to 4 MiB. For a game directory, add `source_type=folder`
 and pass the directory as `path` to read its `sce_sys/icon0.png`, even before

@@ -29,6 +29,7 @@
 #include "sm_path_utils.h"
 #include "sm_paths.h"
 #include "sm_pkg.h"
+#include "sm_kraken.h"
 #include "sm_pkg_native.h"
 #include "sm_pkg_server.h"
 #include "sm_pkg_stream.h"
@@ -219,6 +220,8 @@ static void handle_file_listing(struct MHD_Connection *connection, struct json_o
 static void handle_backport_operation(struct MHD_Connection *connection, struct json_object *request,
                                       game_storage_operation_t operation);
 static void handle_package_install(struct MHD_Connection *connection, struct json_object *request, bool streaming, bool from_queue);
+static void handle_package_mount(struct MHD_Connection *connection,
+                                 struct json_object *request);
 static void handle_package_queue(struct MHD_Connection *connection, struct json_object *request);
 static void handle_source_install(struct MHD_Connection *connection, struct json_object *request);
 static void handle_source_delete(struct MHD_Connection *connection, struct json_object *request);
@@ -702,6 +705,7 @@ static void handle_version(struct MHD_Connection *fd) {
       !append_json_string(capabilities, "game_info") ||
       !append_json_string(capabilities, "game_data_sizes") ||
       !append_json_string(capabilities, "pkg_install") ||
+      !append_json_string(capabilities, "pkg_mount") ||
       !append_json_string(capabilities, "pkg_browser_stream") ||
       !append_json_string(capabilities, "smb2_smb3") ||
       !append_json_string(capabilities, "game_icon") ||
@@ -1046,6 +1050,7 @@ typedef struct {
   const char *source_type;
   const char *image_type;
   bool image_backed;
+  bool kraken;
   uint64_t usb_mount_id;
 } game_source_info_t;
 
@@ -1057,6 +1062,13 @@ static bool resolve_game_source(const sm_game_cache_snapshot_entry_t *source,
   (void)strlcpy(info->runtime_path, source->path,
                 sizeof(info->runtime_path));
 
+  if (sm_kraken_is_cache(source->path)) {
+    (void)sm_kraken_source(source->path, info->physical_path);
+    info->source_type = "pkg";
+    info->image_type = "";
+    info->kraken = true;
+    return true;
+  }
   char image_path[MAX_PATH];
   if (read_mount_image_link(source->title_id, image_path,
                             sizeof(image_path))) {
@@ -1338,7 +1350,7 @@ static struct json_object *game_to_json(
   const char *last_access_time = metadata ? metadata->last_access_time : "";
   const char *install_time = metadata ? metadata->install_time : "";
   const char *platform = game_platform_name(source->title_id, metadata);
-  bool can_toggle_fakelib = strcmp(platform, "ps5") == 0;
+  bool can_toggle_fakelib = strcmp(platform, "ps5") == 0 && !source_info.kraken;
   sm_fakelib_mode_t fakelib_mode =
       sm_config_title_fakelib_mode(cfg, source->title_id);
   bool fakelib_enabled = fakelib_mode != SM_FAKELIB_DISABLED;
@@ -1373,7 +1385,7 @@ static struct json_object *game_to_json(
   }
   if (!add_json_bool(item, "installed_pkg", installed_pkg) ||
       !add_json_bool(item, "can_uninstall", installed) ||
-      !add_json_bool(item, "can_manage_source", !installed_pkg) ||
+      !add_json_bool(item, "can_manage_source", !installed_pkg && !source_info.kraken) ||
       !add_json_bool(item, "can_toggle_fakelib", can_toggle_fakelib) ||
       !add_json_bool(item, "ignore_global_fakelib",
                      sm_config_title_global_fakelib_excluded(cfg, source->title_id)) ||
@@ -2863,7 +2875,11 @@ static int request_game_uninstall(const char *title_id,
   }
 
   bool source_missing = false;
+  char mounted_package[MAX_PATH] = "";
   if (!installed_pkg) {
+    char runtime_source[MAX_PATH];
+    if (read_mount_link(title_id, runtime_source, sizeof(runtime_source)))
+      (void)sm_kraken_source(runtime_source, mounted_package);
     game_source_info_t info;
     const char *source_error = NULL;
     (void)resolve_storage_source(title_id, GAME_STORAGE_DELETE, &info,
@@ -2880,6 +2896,9 @@ static int request_game_uninstall(const char *title_id,
 
   invalidate_app_db_title_cache();
   reset_title_attempts(title_id, NULL, NULL);
+  if (*mounted_package && !sm_manual_remove_path(mounted_package, NULL))
+    log_debug("  [API] could not remove unregistered package %s from manual sources: %s",
+              mounted_package, strerror(errno));
   if (source_missing)
     *scan_queued_out = request_scan_now("HTTP API missing source uninstall requested");
   log_debug("  [API] uninstall requested: title=%s", title_id);
@@ -3188,6 +3207,8 @@ static void dispatch_request(struct MHD_Connection *connection,
     handle_backport_operation(connection, json, GAME_STORAGE_DELETE);
   } else if (strcmp(route, SM_API_ROUTE_PACKAGE_INSTALL) == 0) {
     handle_package_install(connection, json, false, false);
+  } else if (strcmp(route, SM_API_ROUTE_PACKAGE_MOUNT) == 0) {
+    handle_package_mount(connection, json);
   } else if (strcmp(route, SM_API_ROUTE_PACKAGE_QUEUE) == 0) {
     handle_package_queue(connection, json);
   } else if (strcmp(route, SM_API_ROUTE_PACKAGE_STREAM) == 0) {
@@ -4488,8 +4509,10 @@ static bool package_root(const char *path, char root[MAX_PATH]) {
     size_t length=slash ? (size_t)(slash-canonical) : strlen(canonical);
     memcpy(root,canonical,length); root[length]=0; return true;
   }
-  if (path_matches_root_or_child(path, "/data")) {
-    strlcpy(root, "/data", MAX_PATH);
+  if (path_matches_root_or_child(path, "/data") ||
+      path_matches_root_or_child(path, "/user/data")) {
+    strlcpy(root, path_matches_root_or_child(path, "/data") ? "/data" : "/user/data",
+            MAX_PATH);
     return true;
   }
   for (int i = 0; i < 10; ++i) {
@@ -4517,6 +4540,49 @@ static int resolve_package_path(const char *path, char resolved[MAX_PATH], bool 
   if (lstat(resolved, &st) != 0) return errno;
   if (directory ? !S_ISDIR(st.st_mode) : !S_ISREG(st.st_mode)) return EINVAL;
   return 0;
+}
+
+static void handle_package_mount(struct MHD_Connection *connection,
+                                 struct json_object *request) {
+  char source[MAX_PATH], manual[MAX_PATH];
+  int status = resolve_package_path(package_string(request, "path"), source, false);
+  if (status != 0) {
+    send_error_response(connection, operation_http_status(status), status, strerror(status));
+    return;
+  }
+  sm_pkg_info_t info;
+  if (!sm_kraken_is_package(source) || !sm_manual_normalize_path(source, manual) ||
+      strcmp(manual, source) != 0 || !sm_pkg_parse_file(source, NULL, &info) ||
+      !sm_kraken_can_mount(&info)) {
+    send_error_response(connection, 400, ENOTSUP,
+                        "Mount requires a local plaintext PS5 debug base-game PKG");
+    return;
+  }
+  char managed[MAX_PATH], backing[MAX_PATH];
+  bool tracked = read_mount_link(info.title_id, managed, sizeof(managed));
+  bool registered = is_installed(info.title_id);
+  bool existing_kraken = tracked && sm_kraken_source(managed, backing);
+  if ((tracked && !sm_kraken_is_cache(managed)) ||
+      (registered && (!existing_kraken || (strcmp(source, backing) != 0 && path_exists(backing))))) {
+    send_error_response(connection, 409, EEXIST, "The Title ID already has another game source");
+    return;
+  }
+  bool changed = false;
+  if (!sm_manual_add_path(source, &changed)) {
+    status = errno ? errno : EIO;
+    send_error_response(connection, operation_http_status(status), status, strerror(status));
+    return;
+  }
+  request_scan_now("HTTP API Kraken package mount");
+  struct json_object *response = new_status_response(0);
+  if (!response || !add_json_string(response, "title_id", info.title_id) ||
+      !add_json_bool(response, "changed", changed)) {
+    if (response) json_object_put(response);
+    send_out_of_memory_response(connection);
+    return;
+  }
+  (void)send_json_object(connection, 202, response);
+  json_object_put(response);
 }
 
 static void handle_source_install(struct MHD_Connection *connection, struct json_object *request) {
@@ -4835,6 +4901,7 @@ static bool add_package_state(struct json_object *item, const sm_pkg_info_t *inf
   pthread_mutex_unlock(&g_storage_job.mutex);
   return add_json_bool(item, "installed", info->pkg_kind == PKG_KIND_BASE && pkg_installed) &&
     add_json_bool(item, "base_installed", base) && add_json_bool(item, "base_queued", queued_base) &&
+    add_json_bool(item, "mountable", sm_kraken_can_mount(info)) &&
     add_package_icon_info(item, info);
 }
 

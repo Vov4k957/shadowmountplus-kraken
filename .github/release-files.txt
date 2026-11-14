@@ -20,3 +20,5 @@ licenses/json-c-COPYING.txt
 licenses/SMB-NOTICES.txt
 licenses/libsmb2-COPYING.txt
 licenses/libsmb2-LGPL-2.1.txt
+vendor/kraken/LICENSE
+vendor/kraken/THIRD_PARTY_NOTICES

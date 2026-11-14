@@ -1312,6 +1312,8 @@
           packageEmpty: "No PKG files or folders here",
           packageInvalid: "Invalid or unsupported PKG",
           packageInstall: "Install",
+          packageMount: "Mount .pkg",
+          packageMountQueued: "Mount queued. Check the Library or Debug log.",
           packageConfirm: "Install {title} ({kind})?\n{path}",
           packageBase: "Game",
           packageTruncated: "Only the first 256 entries are shown. Open a subfolder.",
@@ -1617,6 +1619,8 @@
           packageEmpty: "Здесь нет файлов PKG или папок",
           packageInvalid: "Повреждённый или неподдерживаемый PKG",
           packageInstall: "Установить",
+          packageMount: "Смонтировать .pkg",
+          packageMountQueued: "Монтирование в очереди. Проверь библиотеку или журнал отладки.",
           packageConfirm: "Установить {title} ({kind})?\n{path}",
           packageBase: "Игра",
           packageTruncated: "Показаны первые 256 элементов. Откройте вложенную папку.",
@@ -5005,6 +5009,8 @@
           add.textContent = t(queued ? "packageQueued" : "packageEnqueue");
           add.disabled = !entry.installable || installed || queued || (missing && !baseQueued && !(!state.packageQueue && entry.base_queued)) || queue.length >= 32 || state.packageQueueLoading || state.browserBatchRunning ||
             Boolean(state.storageJob?.active && state.storageJob.operation === "delete" && !state.storageJob.title_id);
+          const mount = row.querySelector(".package-mount");
+          if (mount) mount.disabled = installed || queued || state.browserBatchRunning || Boolean(state.storageJob?.active);
         });
         $("packageList").querySelectorAll(".backport-install").forEach(button => {
           button.disabled = button.dataset.selfSource === "true" || Boolean(state.storageJob?.active);
@@ -5310,6 +5316,8 @@
           add.dataset.path = entry.path;
           const actions = node("div", "package-actions");
           actions.append(install, add);
+          if (entry.mountable)
+            actions.append(actionButton(t("packageMount"), () => mountPackage(entry), "package-mount"));
           appendSourceDelete(actions, entry);
           row.append(cover, info, actions);
           list.append(row);
@@ -5360,6 +5368,15 @@
         try {
           renderStorageJob(await api("/sources/delete", { path: entry.path, confirm: true }));
           scheduleStorageJobPoll();
+        } catch (error) { toast(errorMessage(error), true); }
+      }
+
+      async function mountPackage(entry) {
+        try {
+          await api("/packages/mount", { path: entry.path });
+          logActivity(t("packageMountQueued"));
+          toast(t("packageMountQueued"));
+          setTimeout(refreshAll, 1600);
         } catch (error) { toast(errorMessage(error), true); }
       }
 

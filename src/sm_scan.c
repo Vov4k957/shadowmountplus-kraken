@@ -20,6 +20,7 @@
 #include "sm_image_index.h"
 #include "sm_image.h"
 #include "sm_install_queue.h"
+#include "sm_kraken.h"
 #include "sm_manual.h"
 #include "sm_self.h"
 #include "sm_shellcore_service.h"
@@ -324,6 +325,13 @@ static existing_directory_result_t handle_existing_directory_candidate(
   bool installed = in_app_db && is_installed(info->title_id);
   bool appmeta_present =
       installed ? get_appmeta_present_for_scan_cycle(info->title_id) : false;
+  if (installed && has_tracked_path && sm_kraken_is_cache(tracked_path) &&
+      !link_matches_source) {
+    (void)strlcpy(preferred_existing_path_out, tracked_path, MAX_PATH);
+    if (sm_kraken_source_ready(tracked_path))
+      cache_game_entry(tracked_path, info->title_id, info->title_name);
+    return EXISTING_DIRECTORY_PREFER_CACHED;
+  }
   link_matches_source = installed && link_matches_source;
   bool source_valid = false;
   if (link_matches_source)
@@ -885,6 +893,37 @@ static void collect_scan_candidates_from_manual_path(
   clear_manual_missing_source(manual_path);
 
   const char *name = get_filename_component(manual_path);
+  if (S_ISREG(st.st_mode) && sm_kraken_is_package(manual_path)) {
+    if (!wait_for_stability_fast(manual_path, "PKG")) {
+      if (unstable_found_out)
+        *unstable_found_out = true;
+      return;
+    }
+    sm_pkg_info_t package;
+    if (!sm_pkg_parse_file(manual_path, &st, &package) ||
+        !sm_kraken_can_mount(&package)) {
+      log_debug("  [KRAKEN] expected a plaintext PS5 debug base-game PKG: %s",
+                manual_path);
+      return;
+    }
+    if (!app_db->titles_ready || sm_shellcore_title_is_protected(package.title_id))
+      return;
+    if (find_scan_candidate_index_by_title_id(candidates, *candidate_count, package.title_id) >= 0)
+      return;
+    char tracked[MAX_PATH];
+    bool managed = read_mount_link(package.title_id, tracked, sizeof(tracked));
+    bool registered = app_db_title_list_contains(app_db->titles, package.title_id);
+    if ((managed && !sm_kraken_is_cache(tracked)) || (registered && !managed)) {
+      log_debug("  [KRAKEN] title already has a different source: %s", package.title_id);
+      return;
+    }
+    char cache[MAX_PATH];
+    if (sm_kraken_prepare(&package, cache))
+      collect_scan_candidates_from_manual_root(
+          cache, manual_path, candidates, max_candidates, candidate_count, app_db,
+          discovered_param_roots, discovered_param_root_count, unstable_found_out);
+    return;
+  }
   if (S_ISREG(st.st_mode) &&
       is_supported_image_file_path(manual_path, name)) {
     bool index_ready = sm_image_index_visit_ready_titles(
