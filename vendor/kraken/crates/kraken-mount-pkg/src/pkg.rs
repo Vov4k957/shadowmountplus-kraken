@@ -217,6 +217,11 @@ pub(crate) struct Image {
 
 impl Image {
     pub fn open<R: PRead>(io: &R, len: u64) -> Result<Image, Error> {
+        Self::open_with_block_lengths(io, len, None)
+    }
+
+    pub fn open_with_block_lengths<R: PRead>(io: &R, len: u64,
+                                             progress: Option<&dyn Fn(u64, u64)>) -> Result<Image, Error> {
         let h = header(io, len)?;
         let cnt = container(io, len, h.cnt_offset)?;
         let geo = outer::Geometry { pfs_offset: h.pfs_offset, blocks: h.outer_blocks };
@@ -234,7 +239,7 @@ impl Image {
         let image = OuterFile::map(io, &geo, &nodes[image_ino], "pfs_image.dat")?;
         let naps = OuterFile::map(io, &geo, &nodes[naps_ino], "naps_pkg_layout.dat")?;
         drop(nodes);
-        let kraken = Kraken::open(io, &naps, image.size)?;
+        let kraken = Kraken::open(io, &naps, &image, progress)?;
         Ok(Image {
             pfs_offset: h.pfs_offset,
             meta_base: h.meta_base,

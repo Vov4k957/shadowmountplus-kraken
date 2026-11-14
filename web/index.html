@@ -1297,6 +1297,7 @@
           krakenCheckPatch: "Checking the update",
           krakenCheckBase: "Checking the base PKG",
           krakenBuildCache: "Preparing the game files",
+          krakenCheckLayout: "Checking Kraken block boundaries",
           packageNoBase: "No base game",
           packageEnqueue: "Add to queue",
           packageQueued: "Queued",
@@ -1619,6 +1620,7 @@
           krakenCheckPatch: "Проверка обновления",
           krakenCheckBase: "Проверка базового PKG",
           krakenBuildCache: "Подготовка файлов игры",
+          krakenCheckLayout: "Проверка границ блоков Kraken",
           packageNoBase: "Нет игры",
           packageEnqueue: "В очередь",
           packageQueued: "В очереди",
@@ -3464,7 +3466,7 @@
 
       function storageJobStateLabel(job) {
         if (job.operation === "mount_package" && job.state === "transferring")
-          return t(["krakenCheckPatch", "krakenCheckBase", "krakenBuildCache"][job.kraken_phase] || "krakenBuildCache");
+          return t(["krakenCheckPatch", "krakenCheckBase", "krakenBuildCache", "krakenCheckLayout"][job.kraken_phase] || "krakenBuildCache");
         const labels = {
           installing: t("jobInstalling"),
           idle: t("jobIdle"),

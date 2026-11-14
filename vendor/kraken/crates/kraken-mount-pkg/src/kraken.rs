@@ -3,10 +3,13 @@
 //! `Kraken::new`, `stored`). Blocks may be raw, Kraken-compressed or sparse;
 //! byte shuffles are refused.
 
+use alloc::boxed::Box;
 use alloc::format;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::ops::RangeInclusive;
 
+use crate::decoder::{self, Scratch};
 use crate::outer::OuterFile;
 use crate::pkg::{corrupt, le64, unsupported};
 pub(crate) use crate::decoder::Desc;
@@ -46,6 +49,57 @@ impl KBlock {
         self.stored_len == self.len
             && self.desc.mode & 0b1_1011 == 0
             && u64::from(self.desc.even_len) == u64::from(self.len).min(HALF)
+    }
+}
+
+/// Resolve a boundary that the descriptor gives only to 16-byte precision.
+/// Both the stored span and the range of possible output lengths are already
+/// bounded by the layout. Decode before assigning either side of the boundary.
+#[derive(Default)]
+struct BlockLength {
+    src: Vec<u8>,
+    dst: Vec<u8>,
+    scratch: Option<Box<Scratch>>,
+}
+
+impl BlockLength {
+    fn resolve<R: PRead>(
+        &mut self, io: &R, image: &OuterFile, block: &KBlock, lengths: RangeInclusive<u32>,
+    ) -> Result<u32, Error> {
+        // Raw bytes already agree with the original geometry, or their stored
+        // length supplies the endpoint within the range allowed by the record.
+        if block.desc.mode & 0b1_1011 == 0 && lengths.contains(&block.stored_len) &&
+            u64::from(block.desc.even_len) == u64::from(block.stored_len).min(HALF) {
+            return Ok(block.stored_len);
+        }
+        self.src.resize(block.stored_len as usize, 0);
+        image.read(io, block.stored_at, &mut self.src)?;
+        let scratch = self.scratch.get_or_insert_with(Scratch::new_boxed);
+        let max = *lengths.end();
+        self.dst.resize(max as usize, 0);
+        let error = match decoder::decode_block(&self.src, block.desc, &mut self.dst, scratch) {
+            Ok(_) => return Ok(max),
+            Err(error) => error,
+        };
+
+        let decode_error = |e| Error::Decode(format!(
+            "mount {:#x}, stored {:#x}, stored len {}, even {}, mode {:#x}, allowed lengths {lengths:?}: {e}",
+            block.logical, block.stored_at, block.stored_len, block.desc.even_len, block.desc.mode,
+        ));
+        let length = match error {
+            decoder::Error::OutputLength { half_at, actual, .. } => (half_at + actual) as u32,
+            _ if block.stored_len > block.desc.even_len && block.desc.mode & 0x10 == 0 => {
+                // The second half can be a plain copy while the first is compressed.
+                decoder::HALF as u32 + block.stored_len - block.desc.even_len
+            }
+            _ => return Err(decode_error(error)),
+        };
+        if length == max || !lengths.contains(&length) {
+            return Err(decode_error(error));
+        }
+        self.dst.truncate(length as usize);
+        decoder::decode_block(&self.src, block.desc, &mut self.dst, scratch).map_err(decode_error)?;
+        Ok(length)
     }
 }
 
@@ -151,9 +205,11 @@ impl Kraken {
 }
 
 impl Kraken {
-    /// Walk descriptor `naps` (the way `describe` does) for an image of `image_size` stored
-    /// bytes. Raw and compressed blocks are kept; byte-shuffled ones are refused.
-    pub fn open<R: PRead>(io: &R, naps: &OuterFile, image_size: u64) -> Result<Self, Error> {
+    /// Walk `naps` for the stored inner image. For updates, the progress
+    /// callback also selects validation of ambiguous in-file boundaries.
+    pub fn open<R: PRead>(
+        io: &R, naps: &OuterFile, image: &OuterFile, verify_lengths: Option<&dyn Fn(u64, u64)>,
+    ) -> Result<Self, Error> {
         if naps.size < 16 || naps.size > MAX_DESCRIPTOR {
             return Err(corrupt(format!("layout descriptor of {} bytes", naps.size)));
         }
@@ -187,12 +243,19 @@ impl Kraken {
         let mut tag = [0u8; 3];
         naps.read(io, (rec_at - 3) as u64, &mut tag)?;
         let strict = tag == EXACT_LAYOUT;
+        let verify_lengths = verify_lengths.filter(|_| !strict);
+        let mut lengths = BlockLength::default();
         let mut rec = Records { io, file: naps, at: rec_at as u64, count: records, start: 0, loaded: 0, buf: Vec::new() };
         let mut blocks: Vec<KBlock> = Vec::with_capacity((ublocks as usize + files).min(1 << 22));
         let (mut cursor, mut logical) = (0u64, 0u64);
         let mut next_is_anchor = true;
         let mut carried_nibble = 0u64;
         for i in 0..records.saturating_sub(1) {
+            if let Some(progress) = verify_lengths {
+                if i % CHUNK == 0 {
+                    progress(logical, mount);
+                }
+            }
             let v = rec.get(i)?;
             let f = |lo: u32, w: u32| ((v >> lo) & ((1u128 << w) - 1)) as u64;
             let nibble = core::mem::replace(&mut carried_nibble, f(68, 4));
@@ -216,11 +279,22 @@ impl Kraken {
             if (logical % WINDOW) >> 4 != f(0, 14) {
                 return Err(corrupt(format!("record {i}: logical offset disagrees")));
             }
-            let cap = logical + (bounds.next(logical) - logical).min(UBLOCK);
+            let boundary = bounds.next(logical);
+            let cap = boundary.min(logical + UBLOCK);
             let next = if f(66, 1) == 1 { i + 2 } else { i + 1 };
+            let mut possible = None;
             let len = if next + 1 < records {
                 let at16 = (logical & !(WINDOW - 1)) | ((rec.get(next)? as u64 & 0x3FFF) << 4);
                 let at16 = if at16 <= logical & !0xF { at16 + WINDOW } else { at16 };
+                // When there is no exact nibble, the next record supplies a bucket of
+                // 16 offsets. A nearby file boundary is exact and still takes precedence.
+                if verify_lengths.is_some() && at16 < cap && at16 + 16 <= boundary {
+                    let min = (at16 - logical) as u32;
+                    let max = (cap.min(at16 + 15) - logical) as u32;
+                    if min < max {
+                        possible = Some(min..=max);
+                    }
+                }
                 let low = if strict { (rec.get(next - 1)? >> 68) as u64 & 0xF } else { logical & 0xF };
                 let exact = at16 | low;
                 if at16 + 16 <= cap || (strict && exact < cap) { exact - logical } else { cap - logical }
@@ -243,22 +317,32 @@ impl Kraken {
             if f(44, 4) != 0 {
                 return Err(unsupported(format!("block at mount {logical:#x} is byte-shuffled; {REPACK}")));
             }
-            if len == 0 || len > UBLOCK || stored_len > 2 * UBLOCK || cursor.checked_add(stored_len).map_or(true, |e| e > image_size) {
+            if len == 0 || len > UBLOCK || stored_len > 2 * UBLOCK || end > image.size {
                 return Err(corrupt(format!("the block at mount {logical:#x} runs past the stored image")));
             }
-            blocks.push(KBlock {
+            let mut block = KBlock {
                 logical,
                 stored_at: cursor,
                 len: len as u32,
                 stored_len: stored_len as u32,
                 desc: Desc { even_len: f(14, 17) as u32 + 1, mode: f(32, 5) as u8 },
-            });
+            };
+            if let Some(possible) = possible {
+                block.len = lengths.resolve(io, image, &block, possible).map_err(|e| match e {
+                    Error::Decode(message) => Error::Decode(format!("layout record {i}, tag {tag:02x?}: {message}")),
+                    e => e,
+                })?;
+            }
+            logical += u64::from(block.len);
+            blocks.push(block);
             cursor = end;
-            logical += len;
         }
         bounds.append_sparse(&mut logical, &mut blocks);
         if logical != mount {
             return Err(corrupt(format!("blocks tile to {logical:#x}, the mount is {mount:#x}")));
+        }
+        if let Some(progress) = verify_lengths {
+            progress(mount, mount);
         }
         blocks.shrink_to_fit();
         Ok(Self { blocks, mount_size: mount, tag })

@@ -2545,8 +2545,8 @@ components:
           minimum: 0
         kraken_phase:
           type: integer
-          enum: [0, 1, 2]
-          description: For a mount_package job, 0 checks patch bytes, 1 checks base bytes, and 2 builds the cache.
+          enum: [0, 1, 2, 3]
+          description: For a mount_package job, 0 checks patch bytes, 1 checks base bytes, 2 builds the cache, and 3 checks Kraken block boundaries before cache build.
         result_status:
           type: integer
           minimum: 0
@@ -2711,7 +2711,7 @@ components:
     OperationErrorReason:
       type: string
       description: Stable reason code for localized operation errors; empty for generic errno failures.
-      enum: ["", rest_mode, game_active, install_pending, runtime_prepared, scanner_busy, runtime_busy, title_unmount_busy, image_unmount_busy, unpack_mounted, storage_busy, storage_unavailable, usb_disk_busy, usb_mount_busy, usb_partition_busy, usb_image_busy, usb_mount_changed, usb_eject_unconfirmed, usb_eject_failed, pkg_invalid, pkg_base_missing, pkg_stream_lost, pkg_source_changed, pkg_already_installed, pkg_queued, pkg_queue_full, kraken_patch_invalid, kraken_base_missing, kraken_base_invalid, kraken_title_conflict, kraken_use_mount, kraken_sources_changed]
+      enum: ["", rest_mode, game_active, install_pending, runtime_prepared, scanner_busy, runtime_busy, title_unmount_busy, image_unmount_busy, unpack_mounted, storage_busy, storage_unavailable, usb_disk_busy, usb_mount_busy, usb_partition_busy, usb_image_busy, usb_mount_changed, usb_eject_unconfirmed, usb_eject_failed, pkg_invalid, pkg_base_missing, pkg_stream_lost, pkg_source_changed, pkg_already_installed, pkg_queued, pkg_queue_full, kraken_patch_invalid, kraken_decode_failed, kraken_base_missing, kraken_base_invalid, kraken_title_conflict, kraken_use_mount, kraken_sources_changed]
 
     PackageListing:
       type: object

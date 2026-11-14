@@ -18,7 +18,7 @@
 #define KRAKEN_MARKER ".smp-kraken-source"
 #define KRAKEN_MANIFEST ".smp-kraken-built"
 #define KRAKEN_REVISION "2"
-#define KRAKEN_PATCH_REVISION "3"
+#define KRAKEN_PATCH_REVISION "4"
 #define KRAKEN_PATCH_VOLUME ".smp-kraken-patch.pak"
 
 extern const unsigned char sm_kraken_runtime_start[];

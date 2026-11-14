@@ -159,8 +159,11 @@ fn raw_or_entropy(src: &[u8], dst: &mut [u8], at: usize, len: usize, s: &mut Scr
         // decode_entropy_half: the whole of `src` is one array of exactly `len` bytes.
         let out = &mut dst[at..at + len];
         let (arr, used) = lz::get_array(src, 0, src.len(), len, out, &mut s.lut)?;
-        if used != src.len() || arr.len() != len {
-            return err("kraken: entropy half has the wrong length or trailing bytes");
+        if used != src.len() {
+            return err("kraken: trailing bytes in the entropy half");
+        }
+        if arr.len() != len {
+            return Err(Error::OutputLength { half_at: at, expected: len, actual: arr.len() });
         }
         if let lz::Arr::Src(r) = arr {
             out.copy_from_slice(&src[r]);

@@ -526,7 +526,8 @@ its cache marker. Existing `manual.lst` PKG entries are ignored by the scanner.
 A local debug LIH targeting a Kraken-mounted game can have `mount_patch=true`
 and `mountable=true`. Send its path to the same endpoint to start a
 cancellable storage job with `operation=mount_package`. Its `kraken_phase`
-tracks the update block check (0), base block check (1) and cache build (2).
+tracks the update block check (0), base block check (1), cache build (2), and
+validation of ambiguous Kraken block boundaries before cache build (3).
 Compatibility is checked by content ID and the target image's block digests.
 These checks apply to any supported PS5 title. A patch targeting a
 Kraken-mounted game has `kraken_only=true` and uses this endpoint. The

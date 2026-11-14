@@ -211,7 +211,7 @@ fn prepare_patched(io: &PackageIo, patch: &impl PRead, size: u64, patch_size: u6
     let view = lih::View::open(io, size, patch, patch_size, &cancelled,
                                |done, total| progress(0, done, total))?;
     view.verify_base(|done, total| progress(1, done, total))?;
-    let pkg = Pkg::open(&view, view.len())?;
+    let pkg = Pkg::open_updated_image(&view, view.len(), |done, total| progress(3, done, total))?;
     prepare_package(io, &view, &pkg, size, mtime, basename,
                     |done, total| progress(2, done, total), |pkg, entry, cache, buffer| {
         if cancelled() {

@@ -268,6 +268,15 @@ impl Pkg {
         table(image, walked)
     }
 
+    /// Parse a verified merged update. Some patch layouts record only the high
+    /// bits of an in-file block start. Resolve those positions from the streams
+    /// before exposing file offsets and original-package extents to the caller.
+    pub fn open_updated_image<R: PRead>(io: &R, len: u64, progress: impl Fn(u64, u64)) -> Result<Pkg, Error> {
+        let image = pkg::Image::open_with_block_lengths(io, len, Some(&progress))?;
+        let walked = tree::walk(io, &image)?;
+        table(image, walked)
+    }
+
     fn entry(&self, i: usize) -> Entry<'_> {
         let n = &self.nodes[i];
         let at = n.path_off as usize;

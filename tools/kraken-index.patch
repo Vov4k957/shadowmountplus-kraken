@@ -332,7 +332,23 @@ diff --git a/crates/kraken-mount-pkg/src/lib.rs b/crates/kraken-mount-pkg/src/li
  /// block can extend past its end; the bytes beyond the file's size belong to no file.
  #[derive(Debug, Clone, Copy, PartialEq, Eq)]
  pub struct Block {
-@@ -289,18 +297,18 @@
+@@ -260,6 +268,15 @@
+         table(image, walked)
+     }
+ 
++    /// Parse a verified merged update. Some patch layouts record only the high
++    /// bits of an in-file block start. Resolve those positions from the streams
++    /// before exposing file offsets and original-package extents to the caller.
++    pub fn open_updated_image<R: PRead>(io: &R, len: u64, progress: impl Fn(u64, u64)) -> Result<Pkg, Error> {
++        let image = pkg::Image::open_with_block_lengths(io, len, Some(&progress))?;
++        let walked = tree::walk(io, &image)?;
++        table(image, walked)
++    }
++
+     fn entry(&self, i: usize) -> Entry<'_> {
+         let n = &self.nodes[i];
+         let at = n.path_off as usize;
+@@ -289,18 +306,18 @@
      }
  
      /// The plaintext byte runs of `e` inside the `.pkg`, in file order (empty for a directory).
@@ -354,7 +370,7 @@ diff --git a/crates/kraken-mount-pkg/src/lib.rs b/crates/kraken-mount-pkg/src/li
      pub fn blocks(&self, e: &Entry) -> Result<&[Block], Error> {
          match self.file(e) {
              None => Ok(&[]),
-@@ -319,7 +327,7 @@
+@@ -319,7 +336,7 @@
          let want = (n.size - off).min(buf.len() as u64) as usize;
          if !n.ext_ok {
              let mut dec = pkg::Decoder::new();
@@ -363,7 +379,7 @@ diff --git a/crates/kraken-mount-pkg/src/lib.rs b/crates/kraken-mount-pkg/src/li
              return Ok(want);
          }
          let range = n.ext_start as usize..n.ext_end as usize;
-@@ -338,6 +346,11 @@
+@@ -338,6 +355,11 @@
          }
          Ok(done)
      }
@@ -378,7 +394,7 @@ diff --git a/crates/kraken-mount-pkg/src/lib.rs b/crates/kraken-mount-pkg/src/li
 diff --git a/crates/kraken-mount-pkg/src/kraken.rs b/crates/kraken-mount-pkg/src/kraken.rs
 --- a/crates/kraken-mount-pkg/src/kraken.rs
 +++ b/crates/kraken-mount-pkg/src/kraken.rs
-@@ -1,7 +1,7 @@
+@@ -1,12 +1,15 @@
  //! The Kraken layout descriptor (`naps_pkg_layout.dat`), walked in chunks into a compact block
  //! list. Port of `VF/kraken_image.rs:728-1036` (`describe`) and `FP/mount.rs:35-283` (`KBlock`,
 -//! `Kraken::new`, `stored`). Blocks may be raw or Kraken-compressed; byte shuffles and sparse
@@ -386,9 +402,17 @@ diff --git a/crates/kraken-mount-pkg/src/kraken.rs b/crates/kraken-mount-pkg/src
 +//! `Kraken::new`, `stored`). Blocks may be raw, Kraken-compressed or sparse;
 +//! byte shuffles are refused.
  
++use alloc::boxed::Box;
  use alloc::format;
  use alloc::vec;
-@@ -23,6 +23,7 @@
+ use alloc::vec::Vec;
++use core::ops::RangeInclusive;
+ 
++use crate::decoder::{self, Scratch};
+ use crate::outer::OuterFile;
+ use crate::pkg::{corrupt, le64, unsupported};
+ pub(crate) use crate::decoder::Desc;
+@@ -23,6 +26,7 @@
  /// Records (9 B each) and boundary entries (6 B each) read per chunk.
  const CHUNK: usize = 4096;
  const REPACK: &str = "repack with --kraken stored";
@@ -396,7 +420,7 @@ diff --git a/crates/kraken-mount-pkg/src/kraken.rs b/crates/kraken-mount-pkg/src
  
  /// One mount block: `len` logical bytes at `logical`, stored in `stored_len` bytes at
  /// `stored_at` in `pfs_image.dat`, decoded with `desc`.
-@@ -36,6 +37,10 @@
+@@ -36,6 +40,10 @@
  }
  
  impl KBlock {
@@ -407,7 +431,62 @@ diff --git a/crates/kraken-mount-pkg/src/kraken.rs b/crates/kraken-mount-pkg/src
      /// Stored as a plain copy of its logical bytes (no decoding needed).
      pub fn raw(&self) -> bool {
          self.stored_len == self.len
-@@ -48,6 +53,39 @@
+@@ -44,10 +52,94 @@
+     }
+ }
+ 
++/// Resolve a boundary that the descriptor gives only to 16-byte precision.
++/// Both the stored span and the range of possible output lengths are already
++/// bounded by the layout. Decode before assigning either side of the boundary.
++#[derive(Default)]
++struct BlockLength {
++    src: Vec<u8>,
++    dst: Vec<u8>,
++    scratch: Option<Box<Scratch>>,
++}
++
++impl BlockLength {
++    fn resolve<R: PRead>(
++        &mut self, io: &R, image: &OuterFile, block: &KBlock, lengths: RangeInclusive<u32>,
++    ) -> Result<u32, Error> {
++        // Raw bytes already agree with the original geometry, or their stored
++        // length supplies the endpoint within the range allowed by the record.
++        if block.desc.mode & 0b1_1011 == 0 && lengths.contains(&block.stored_len) &&
++            u64::from(block.desc.even_len) == u64::from(block.stored_len).min(HALF) {
++            return Ok(block.stored_len);
++        }
++        self.src.resize(block.stored_len as usize, 0);
++        image.read(io, block.stored_at, &mut self.src)?;
++        let scratch = self.scratch.get_or_insert_with(Scratch::new_boxed);
++        let max = *lengths.end();
++        self.dst.resize(max as usize, 0);
++        let error = match decoder::decode_block(&self.src, block.desc, &mut self.dst, scratch) {
++            Ok(_) => return Ok(max),
++            Err(error) => error,
++        };
++
++        let decode_error = |e| Error::Decode(format!(
++            "mount {:#x}, stored {:#x}, stored len {}, even {}, mode {:#x}, allowed lengths {lengths:?}: {e}",
++            block.logical, block.stored_at, block.stored_len, block.desc.even_len, block.desc.mode,
++        ));
++        let length = match error {
++            decoder::Error::OutputLength { half_at, actual, .. } => (half_at + actual) as u32,
++            _ if block.stored_len > block.desc.even_len && block.desc.mode & 0x10 == 0 => {
++                // The second half can be a plain copy while the first is compressed.
++                decoder::HALF as u32 + block.stored_len - block.desc.even_len
++            }
++            _ => return Err(decode_error(error)),
++        };
++        if length == max || !lengths.contains(&length) {
++            return Err(decode_error(error));
++        }
++        self.dst.truncate(length as usize);
++        decoder::decode_block(&self.src, block.desc, &mut self.dst, scratch).map_err(decode_error)?;
++        Ok(length)
++    }
++}
++
+ /// Mount offset -> stored range in `pfs_image.dat`. 32 B per block (~13 MB per 100 GB).
  pub(crate) struct Kraken {
      pub blocks: Vec<KBlock>,
      pub mount_size: u64,
@@ -447,7 +526,22 @@ diff --git a/crates/kraken-mount-pkg/src/kraken.rs b/crates/kraken-mount-pkg/src
  }
  
  /// The descriptor's 9-byte records, read `CHUNK` at a time. Lookups move forward and look at
-@@ -144,13 +182,11 @@
+@@ -113,9 +205,11 @@
+ }
+ 
+ impl Kraken {
+-    /// Walk descriptor `naps` (the way `describe` does) for an image of `image_size` stored
+-    /// bytes. Raw and compressed blocks are kept; byte-shuffled ones are refused.
+-    pub fn open<R: PRead>(io: &R, naps: &OuterFile, image_size: u64) -> Result<Self, Error> {
++    /// Walk `naps` for the stored inner image. For updates, the progress
++    /// callback also selects validation of ambiguous in-file boundaries.
++    pub fn open<R: PRead>(
++        io: &R, naps: &OuterFile, image: &OuterFile, verify_lengths: Option<&dyn Fn(u64, u64)>,
++    ) -> Result<Self, Error> {
+         if naps.size < 16 || naps.size > MAX_DESCRIPTOR {
+             return Err(corrupt(format!("layout descriptor of {} bytes", naps.size)));
+         }
+@@ -144,19 +238,24 @@
          if naps.size < (rec_at + records * 9) as u64 {
              return Err(corrupt("layout descriptor shorter than its records"));
          }
@@ -461,10 +555,23 @@ diff --git a/crates/kraken-mount-pkg/src/kraken.rs b/crates/kraken-mount-pkg/src
          naps.read(io, (rec_at - 3) as u64, &mut tag)?;
 -        let strict = tag == [0x00, 0x00, 0x04];
 +        let strict = tag == EXACT_LAYOUT;
++        let verify_lengths = verify_lengths.filter(|_| !strict);
++        let mut lengths = BlockLength::default();
          let mut rec = Records { io, file: naps, at: rec_at as u64, count: records, start: 0, loaded: 0, buf: Vec::new() };
          let mut blocks: Vec<KBlock> = Vec::with_capacity((ublocks as usize + files).min(1 << 22));
          let (mut cursor, mut logical) = (0u64, 0u64);
-@@ -170,6 +206,7 @@
+         let mut next_is_anchor = true;
+         let mut carried_nibble = 0u64;
+         for i in 0..records.saturating_sub(1) {
++            if let Some(progress) = verify_lengths {
++                if i % CHUNK == 0 {
++                    progress(logical, mount);
++                }
++            }
+             let v = rec.get(i)?;
+             let f = |lo: u32, w: u32| ((v >> lo) & ((1u128 << w) - 1)) as u64;
+             let nibble = core::mem::replace(&mut carried_nibble, f(68, 4));
+@@ -170,6 +269,7 @@
                  }
                  continue;
              }
@@ -472,23 +579,65 @@ diff --git a/crates/kraken-mount-pkg/src/kraken.rs b/crates/kraken-mount-pkg/src
              if strict && i > 0 && nibble != logical & 0xF {
                  return Err(corrupt(format!("record {i}: the exact start's low nibble disagrees")));
              }
-@@ -179,7 +216,7 @@
+@@ -179,11 +279,22 @@
              if (logical % WINDOW) >> 4 != f(0, 14) {
                  return Err(corrupt(format!("record {i}: logical offset disagrees")));
              }
 -            let cap = logical + (next_bound(logical).min(mount) - logical).min(UBLOCK);
-+            let cap = logical + (bounds.next(logical) - logical).min(UBLOCK);
++            let boundary = bounds.next(logical);
++            let cap = boundary.min(logical + UBLOCK);
              let next = if f(66, 1) == 1 { i + 2 } else { i + 1 };
++            let mut possible = None;
              let len = if next + 1 < records {
                  let at16 = (logical & !(WINDOW - 1)) | ((rec.get(next)? as u64 & 0x3FFF) << 4);
-@@ -219,26 +256,26 @@
+                 let at16 = if at16 <= logical & !0xF { at16 + WINDOW } else { at16 };
++                // When there is no exact nibble, the next record supplies a bucket of
++                // 16 offsets. A nearby file boundary is exact and still takes precedence.
++                if verify_lengths.is_some() && at16 < cap && at16 + 16 <= boundary {
++                    let min = (at16 - logical) as u32;
++                    let max = (cap.min(at16 + 15) - logical) as u32;
++                    if min < max {
++                        possible = Some(min..=max);
++                    }
++                }
+                 let low = if strict { (rec.get(next - 1)? >> 68) as u64 & 0xF } else { logical & 0xF };
+                 let exact = at16 | low;
+                 if at16 + 16 <= cap || (strict && exact < cap) { exact - logical } else { cap - logical }
+@@ -206,39 +317,49 @@
+             if f(44, 4) != 0 {
+                 return Err(unsupported(format!("block at mount {logical:#x} is byte-shuffled; {REPACK}")));
+             }
+-            if len == 0 || len > UBLOCK || stored_len > 2 * UBLOCK || cursor.checked_add(stored_len).map_or(true, |e| e > image_size) {
++            if len == 0 || len > UBLOCK || stored_len > 2 * UBLOCK || end > image.size {
+                 return Err(corrupt(format!("the block at mount {logical:#x} runs past the stored image")));
+             }
+-            blocks.push(KBlock {
++            let mut block = KBlock {
+                 logical,
+                 stored_at: cursor,
+                 len: len as u32,
+                 stored_len: stored_len as u32,
+                 desc: Desc { even_len: f(14, 17) as u32 + 1, mode: f(32, 5) as u8 },
+-            });
++            };
++            if let Some(possible) = possible {
++                block.len = lengths.resolve(io, image, &block, possible).map_err(|e| match e {
++                    Error::Decode(message) => Error::Decode(format!("layout record {i}, tag {tag:02x?}: {message}")),
++                    e => e,
++                })?;
++            }
++            logical += u64::from(block.len);
++            blocks.push(block);
              cursor = end;
-             logical += len;
+-            logical += len;
          }
 +        bounds.append_sparse(&mut logical, &mut blocks);
          if logical != mount {
              return Err(corrupt(format!("blocks tile to {logical:#x}, the mount is {mount:#x}")));
          }
++        if let Some(progress) = verify_lengths {
++            progress(mount, mount);
++        }
          blocks.shrink_to_fit();
 -        Ok(Self { blocks, mount_size: mount })
 +        Ok(Self { blocks, mount_size: mount, tag })
@@ -514,7 +663,7 @@ diff --git a/crates/kraken-mount-pkg/src/kraken.rs b/crates/kraken-mount-pkg/src
      let mut buf = vec![0u8; CHUNK * 6];
      let mut done = 0usize;
      while done < files {
-@@ -248,22 +285,21 @@
+@@ -248,22 +369,21 @@
          for r in chunk.chunks_exact(6) {
              let off = u64::from_le_bytes([r[0], r[1], r[2], r[3], r[4], 0, 0, 0]);
              if r[5] == 0x40 {
@@ -571,7 +720,28 @@ diff --git a/crates/kraken-mount-pkg/src/pkg.rs b/crates/kraken-mount-pkg/src/pk
  }
  
  impl Decoder {
-@@ -264,11 +264,11 @@
+@@ -217,6 +217,11 @@
+ 
+ impl Image {
+     pub fn open<R: PRead>(io: &R, len: u64) -> Result<Image, Error> {
++        Self::open_with_block_lengths(io, len, None)
++    }
++
++    pub fn open_with_block_lengths<R: PRead>(io: &R, len: u64,
++                                             progress: Option<&dyn Fn(u64, u64)>) -> Result<Image, Error> {
+         let h = header(io, len)?;
+         let cnt = container(io, len, h.cnt_offset)?;
+         let geo = outer::Geometry { pfs_offset: h.pfs_offset, blocks: h.outer_blocks };
+@@ -234,7 +239,7 @@
+         let image = OuterFile::map(io, &geo, &nodes[image_ino], "pfs_image.dat")?;
+         let naps = OuterFile::map(io, &geo, &nodes[naps_ino], "naps_pkg_layout.dat")?;
+         drop(nodes);
+-        let kraken = Kraken::open(io, &naps, image.size)?;
++        let kraken = Kraken::open(io, &naps, &image, progress)?;
+         Ok(Image {
+             pfs_offset: h.pfs_offset,
+             meta_base: h.meta_base,
+@@ -264,11 +269,11 @@
  
      /// Append the `.pkg` byte runs behind mount bytes `off..off + len` to `out`, in order,
      /// merging a run into the previous one (also one already in `out`) when they touch.
@@ -585,7 +755,7 @@ diff --git a/crates/kraken-mount-pkg/src/pkg.rs b/crates/kraken-mount-pkg/src/pk
          }
          for (at, n) in self.kraken.stored(off, len) {
              self.image.pkg_extents(at, n, out)?;
-@@ -277,31 +277,50 @@
+@@ -277,31 +282,50 @@
      }
  
      /// Read block `b`'s stored bytes and decode them into `dec.dst` (kept as a one-block cache).
@@ -651,7 +821,7 @@ diff --git a/crates/kraken-mount-pkg/src/pkg.rs b/crates/kraken-mount-pkg/src/pk
          #[cfg(feature = "probe")]
          if let Some(m) = &self.probe_mount {
              let src = m.get(off as usize..off as usize + buf.len()).ok_or_else(|| corrupt("past the decoded mount"))?;
-@@ -316,7 +335,9 @@
+@@ -316,7 +340,9 @@
              let inner = (off + done as u64 - b.logical) as usize;
              let n = (b.len as usize - inner).min(buf.len() - done);
              let out = &mut buf[done..done + n];
@@ -662,7 +832,7 @@ diff --git a/crates/kraken-mount-pkg/src/pkg.rs b/crates/kraken-mount-pkg/src/pk
                  runs.clear();
                  self.image.pkg_extents(b.stored_at + inner as u64, n as u64, &mut runs)?;
                  let mut at = 0usize;
-@@ -326,8 +347,10 @@
+@@ -326,8 +352,10 @@
                      at += k;
                  }
              } else {
@@ -709,6 +879,20 @@ diff --git a/crates/kraken-mount-pkg/src/decoder/mod.rs b/crates/kraken-mount-pk
  }
  
  /// What a block's layout record says about how it is stored (the fields `decode_described`
+@@ -151,8 +159,11 @@
+         // decode_entropy_half: the whole of `src` is one array of exactly `len` bytes.
+         let out = &mut dst[at..at + len];
+         let (arr, used) = lz::get_array(src, 0, src.len(), len, out, &mut s.lut)?;
+-        if used != src.len() || arr.len() != len {
+-            return err("kraken: entropy half has the wrong length or trailing bytes");
++        if used != src.len() {
++            return err("kraken: trailing bytes in the entropy half");
++        }
++        if arr.len() != len {
++            return Err(Error::OutputLength { half_at: at, expected: len, actual: arr.len() });
+         }
+         if let lz::Arr::Src(r) = arr {
+             out.copy_from_slice(&src[r]);
 diff --git a/crates/kraken-mount-pkg/src/decoder/lz.rs b/crates/kraken-mount-pkg/src/decoder/lz.rs
 --- a/crates/kraken-mount-pkg/src/decoder/lz.rs
 +++ b/crates/kraken-mount-pkg/src/decoder/lz.rs

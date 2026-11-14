@@ -76,6 +76,42 @@ fn lz_asset() -> Vec<u8> {
     stored
 }
 
+fn lz_match_half(seed: &[u8], decoded_len: usize) -> Vec<u8> {
+    // One match at distance 8, so the whole half repeats its seed or history.
+    let escape = (decoded_len - seed.len() - 272) as u32 + 64;
+    let bits = escape.ilog2() + 1;
+    let code_len = bits + bits - 7;
+    let excess = code_len.div_ceil(8);
+    let mut stored = seed.to_vec();
+    stored.push(0x80 | excess as u8);
+    for array in [&[][..], &[60], &[], &[255]] {
+        stored.extend_from_slice(&[0, 0, array.len() as u8]);
+        stored.extend_from_slice(array);
+    }
+    let code = (escape << (32 - code_len)).to_be_bytes();
+    stored.extend_from_slice(&code[..excess as usize]);
+    stored
+}
+
+fn set_layout(pkg: &mut [u8], mount_end: usize, bounds: &[(usize, u8)], records: &[u128], tag: u8) {
+    let ublocks = mount_end.div_ceil(BLOCK);
+    let first_record = (16 + bounds.len() * 6 + (ublocks / 8 + 1) * 10).next_multiple_of(8) + 3;
+    let descriptor_len = first_record + 9 * records.len();
+    let layout = &mut pkg[LAYOUT..LAYOUT + descriptor_len];
+    layout.fill(0);
+    put64(layout, 0, ((bounds.len() - 1) as u64) | 2 << 24 | (ublocks as u64) << 32);
+    put64(layout, 8, ((records.len() - 2) as u64) << 24);
+    layout[first_record - 1] = tag;
+    for (entry, &(offset, kind)) in layout[16..].chunks_exact_mut(6).zip(bounds) {
+        entry[..5].copy_from_slice(&(offset as u64).to_le_bytes()[..5]);
+        entry[5] = kind;
+    }
+    for (entry, record) in layout[first_record..].chunks_exact_mut(9).zip(records) {
+        entry.copy_from_slice(&record.to_le_bytes()[..9]);
+    }
+    outer_inode(pkg, 3, descriptor_len, 6);
+}
+
 // Synthetic plaintext debug package with an all-zero file followed by a
 // stored file and the inode table. The all-zero file has no stored records.
 fn synthetic_pkg(zero_len: usize) -> Vec<u8> {
@@ -141,23 +177,7 @@ fn synthetic_pkg_with_assets(zero_len: usize, leading_raw: &[u8], compressed: Op
     }
     records.push(kraken_record(meta, stored_size, 3 * PAGE) | RUN_END);
     records.extend([1 << 67, 0]); // Terminator and sentinel.
-    let ublocks = mount_end.div_ceil(BLOCK);
-    let first_record = (16 + bounds.len() * 6 + (ublocks / 8 + 1) * 10).next_multiple_of(8) + 3;
-    let descriptor_len = first_record + 9 * records.len();
-    let layout = &mut pkg[LAYOUT..LAYOUT + descriptor_len];
-    put64(layout, 0, ((bounds.len() - 1) as u64) | 2 << 24 | (ublocks as u64) << 32);
-    put64(layout, 8, ((records.len() - 2) as u64) << 24);
-    if let Some((_, _, tag)) = compressed {
-        layout[first_record - 1] = tag;
-    }
-    for (entry, (offset, kind)) in layout[16..].chunks_exact_mut(6).zip(bounds) {
-        entry[..5].copy_from_slice(&(offset as u64).to_le_bytes()[..5]);
-        entry[5] = kind;
-    }
-    for (entry, record) in layout[first_record..].chunks_exact_mut(9).zip(records) {
-        entry.copy_from_slice(&record.to_le_bytes()[..9]);
-    }
-    outer_inode(&mut pkg, 3, descriptor_len, 6);
+    set_layout(&mut pkg, mount_end, &bounds, &records, compressed.map_or(0, |(_, _, tag)| tag));
 
     let image = &mut pkg[IMAGE..IMAGE + stored_size];
     image[..leading_raw.len()].copy_from_slice(leading_raw);
@@ -366,6 +386,71 @@ fn lih_decodes_an_lz_file_up_to_its_inode_end() {
 }
 
 #[test]
+fn lih_resolves_an_interior_kraken_boundary_from_both_halves() {
+    let title = b"UP0001-PPSA54321_00-SYNTHETICPACKAGE";
+    let base = with_digests(synthetic_pkg(BLOCK), title);
+    let file_start = 11;
+    let file_end = BLOCK - 16;
+    let seed = b"abcdefgh";
+    let even = lz_match_half(seed, BLOCK / 2);
+    for size in [105_534, 105_537, 105_523] {
+        let mut target = base.clone();
+        let right_size = if size == 105_523 { 105_534 } else { size };
+        let second = file_start + BLOCK / 2 + right_size;
+        let odd = lz_match_half(&[], size);
+        let compressed_end = file_start + even.len() + odd.len();
+        let tail_end = compressed_end + (file_end - second);
+        let leading = &mut target[IMAGE + 384..IMAGE + PAGE];
+        leading[..file_start].fill(0x73);
+        leading[file_start..file_start + even.len()].copy_from_slice(&even);
+        leading[file_start + even.len()..compressed_end].copy_from_slice(&odd);
+        leading[compressed_end..tail_end].fill(0x75);
+        leading[tail_end..tail_end + 16].fill(0x32);
+        inner_inode(&mut target[IMAGE..], 5, 0x8000, file_start, file_end - file_start);
+        let meta = BLOCK + PAGE;
+        let bounds = [(0, 0), (file_start, 0), (file_end, 0), (BLOCK, 0), (BLOCK + 128, 0),
+                      (BLOCK + 256, 0), (BLOCK + 384, 0), (meta, 0), (meta + 3 * PAGE, 0x40)];
+        let records = [
+            384 << 48,
+            kraken_record(0, 384 + file_start, file_start),
+            kraken_record(file_start, 384 + compressed_end, even.len()) | (0x12 << 32),
+            kraken_record(second, 384 + tail_end, file_end - second),
+            kraken_record(file_end, 384 + tail_end + 16, 16) | RUN_END,
+            0,
+            kraken_record(BLOCK, 128, 128),
+            kraken_record(BLOCK + 128, 256, 128),
+            kraken_record(BLOCK + 256, 384, 128),
+            kraken_record(BLOCK + 384, PAGE, PAGE - 384),
+            kraken_record(meta, BLOCK, 3 * PAGE) | RUN_END,
+            1 << 67, 0,
+        ];
+        set_layout(&mut target, meta + 3 * PAGE, &bounds, &records, 0xe7);
+        let target = with_digests(target, title);
+        let patch = make_patch(&base, &target);
+        let mut io = TestIo { pkg: base.clone(), files: BTreeMap::new() };
+        let reader = PackageIo { context: ptr::from_mut(&mut io).cast(), read, write, loose_size };
+        let result = prepare_patched(&reader, &patch, base.len() as u64, patch.0.len() as u64,
+                                     1, "base.pkg", |_, _, _| {}, || false);
+        if size == right_size {
+            result.unwrap();
+            let manifest = &io.files["ampr_assets.index"];
+            let chunks = get64(manifest, 80) as usize;
+            let loc = get64(manifest, chunks + 12);
+            assert_eq!(loc >> 48, 1);
+            let offset = (loc & ((1 << 48) - 1)) as usize;
+            let actual = &io.files[".smp-kraken-patch.pak"][offset..offset + file_end - file_start];
+            let mut expected = seed.repeat(BLOCK / seed.len());
+            expected.truncate(second - file_start);
+            expected.resize(file_end - file_start, 0x75);
+            assert!(actual == expected);
+        } else {
+            assert!(matches!(result, Err(super::BuildError::Decode(_))), "{result:?}");
+            assert!(!io.files.contains_key("ampr_assets.index"));
+        }
+    }
+}
+
+#[test]
 fn lih_indexes_chunks_by_file_offset() {
     let title = b"EP0000-PPSA01234_00-SYNTHETICPACKAGE";
     // A 64 KiB hole followed by a full raw block. The second index chunk
@@ -422,7 +507,7 @@ fn check_lih(content_id: &[u8; 36], asset: &[u8; 18]) {
     prepare_patched(&reader, &patch, base_size, patch_size, 1, "base.pkg", |phase, _, _| {
         phases.set(phases.get() | 1 << phase);
     }, || false).unwrap();
-    assert_eq!(phases.get(), 0b111);
+    assert_eq!(phases.get(), 0b1111);
     assert_eq!(io.files["eboot.bin"], b"synthetic executable");
     assert_eq!(io.files["kraken.image"], b"kraken/base.pkg");
     assert!(!io.files.contains_key("other.bin"));
