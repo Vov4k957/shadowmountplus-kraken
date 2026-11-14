@@ -437,6 +437,7 @@ static bool mount_and_install(const char *src_path, const char *title_id,
       notify_system_l10n(SM_L10N_REGISTER_FAILED_UNAVAILABLE, title_name,
                          title_id);
     }
+    errno = EIO;
     return false;
   }
   mark_register_attempted(title_id);
@@ -458,9 +459,28 @@ static bool mount_and_install(const char *src_path, const char *title_id,
     log_debug("  [REG] FAIL: 0x%x", res);
     notify_system_l10n(SM_L10N_REGISTER_FAILED_CODE, title_name, title_id,
                        (uint32_t)res);
+    errno = EIO;
     return false;
   }
 
+  return true;
+}
+
+bool sm_install_mount_game(const char *source, const char *title_id,
+                           const char *title_name, bool already_registered) {
+  errno = 0;
+  if (!mount_and_install(source, title_id, title_name, already_registered,
+                         !already_registered, false, NULL)) {
+    if (errno == 0)
+      errno = EIO;
+    return false;
+  }
+  if (should_stop_requested() || runtime_sleep_mode_active()) {
+    errno = ECANCELED;
+    return false;
+  }
+  clear_failed_mount_attempts(title_id);
+  cache_game_entry(source, title_id, title_name);
   return true;
 }
 

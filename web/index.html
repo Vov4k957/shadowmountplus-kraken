@@ -1288,6 +1288,11 @@
           krakenPatchApplied: "Update applied",
           krakenPatchInvalid: "Could not apply this LIH update. Check that it matches the original base PKG and see the debug log.",
           krakenBaseMissing: "Mount the matching base PKG with U first.",
+          krakenBaseInvalid: "Could not mount the base PKG. See the debug log.",
+          krakenTitleConflict: "The title already has another source.",
+          krakenUseMount: "Use U for a compatible LIH update on a mounted PKG. System installation requires an installed base.",
+          krakenSourcesChanged: "A source PKG changed during the operation. Check the files and try again.",
+          krakenUnsupportedPatch: "This LIH cannot be applied to the current mounted PKG.",
           krakenCheckPatch: "Checking the update",
           krakenCheckBase: "Checking the base PKG",
           krakenBuildCache: "Preparing the game files",
@@ -1323,7 +1328,6 @@
           packageInvalid: "Invalid or unsupported PKG",
           packageInstall: "Install",
           packageMount: "Mount .pkg",
-          packageMountQueued: "Mount queued. Check the Library or Debug log.",
           packageConfirm: "Install {title} ({kind})?\n{path}",
           packageBase: "Game",
           packageTruncated: "Only the first 256 entries are shown. Open a subfolder.",
@@ -1605,6 +1609,11 @@
           krakenPatchApplied: "Обновление применено",
           krakenPatchInvalid: "Не удалось применить LIH-патч. Проверьте, подходит ли он к исходному базовому PKG, и откройте журнал отладки.",
           krakenBaseMissing: "Сначала смонтируйте подходящий базовый PKG кнопкой U.",
+          krakenBaseInvalid: "Не удалось смонтировать базовый PKG. Подробности в журнале отладки.",
+          krakenTitleConflict: "У игры уже зарегистрирован другой источник.",
+          krakenUseMount: "Для совместимого LIH-патча смонтированного PKG используйте U. Для системной установки нужна установленная база.",
+          krakenSourcesChanged: "Один из PKG изменился во время операции. Проверьте файлы и повторите попытку.",
+          krakenUnsupportedPatch: "Этот LIH-патч нельзя применить к смонтированному PKG.",
           krakenCheckPatch: "Проверка обновления",
           krakenCheckBase: "Проверка базового PKG",
           krakenBuildCache: "Подготовка файлов игры",
@@ -1640,7 +1649,6 @@
           packageInvalid: "Повреждённый или неподдерживаемый PKG",
           packageInstall: "Установить",
           packageMount: "Смонтировать .pkg",
-          packageMountQueued: "Монтирование в очереди. Проверь библиотеку или журнал отладки.",
           packageConfirm: "Установить {title} ({kind})?\n{path}",
           packageBase: "Игра",
           packageTruncated: "Показаны первые 256 элементов. Откройте вложенную папку.",
@@ -3223,7 +3231,9 @@
         storage_unavailable: "busyStorageUnavailable",
         pkg_invalid: "packageInvalid", pkg_base_missing: "packageBaseMissing", pkg_already_installed: "packageInstalled", pkg_queued: "packageQueued", pkg_queue_full: "packageQueueFull",
         pkg_stream_lost: "packageStreamLost", pkg_source_changed: "sourceUnavailable",
-        kraken_patch_invalid: "krakenPatchInvalid", kraken_base_missing: "krakenBaseMissing"
+        kraken_patch_invalid: "krakenPatchInvalid", kraken_base_missing: "krakenBaseMissing",
+        kraken_base_invalid: "krakenBaseInvalid", kraken_title_conflict: "krakenTitleConflict",
+        kraken_use_mount: "krakenUseMount", kraken_sources_changed: "krakenSourcesChanged"
       };
 
       function operationErrorMessage(reason, fallback, details = {}) {
@@ -5029,9 +5039,9 @@
             Boolean(state.storageJob?.active && state.storageJob.source === entry.path);
           const install = row.querySelector(".package-install"), add = row.querySelector(".package-enqueue");
           install.textContent = t(installed ? "packageInstalled" : missing ? "packageNoBase" : entry.kind === "base" && entry.base_installed ? "packageReplace" : entry.kind === "patch" ? "packageUpdate" : "packageInstall");
-          install.disabled = entry.mount_patch || !entry.installable || installed || missing || queued || state.browserBatchRunning || state.packageQueueLoading || Boolean(state.storageJob?.active);
+          install.disabled = entry.kraken_only || !entry.installable || installed || missing || queued || state.browserBatchRunning || state.packageQueueLoading || Boolean(state.storageJob?.active);
           add.textContent = t(queued ? "packageQueued" : "packageEnqueue");
-          add.disabled = entry.mount_patch || !entry.installable || installed || queued || (missing && !baseQueued && !(!state.packageQueue && entry.base_queued)) || queue.length >= 32 || state.packageQueueLoading || state.browserBatchRunning ||
+          add.disabled = entry.kraken_only || !entry.installable || installed || queued || (missing && !baseQueued && !(!state.packageQueue && entry.base_queued)) || queue.length >= 32 || state.packageQueueLoading || state.browserBatchRunning ||
             Boolean(state.storageJob?.active && state.storageJob.operation === "delete" && !state.storageJob.title_id);
           const mount = row.querySelector(".package-mount");
           if (mount) mount.disabled = installed || queued || state.browserBatchRunning || Boolean(state.storageJob?.active);
@@ -5333,6 +5343,8 @@
             : `${t("packageInvalid")} · ${formatBytes(entry.size_bytes)}`;
           info.append(node("p", "subtle", metadata), node("p", "subtle", entry.name));
           if (entry.kraken_patch_applied) info.append(node("p", "subtle", t("krakenPatchApplied")));
+          else if (entry.kraken_only && !entry.mount_patch)
+            info.append(node("p", "subtle", t("krakenUnsupportedPatch")));
           const install = actionButton(t("packageInstall"), () => installPackage(entry), "primary package-install");
           install.disabled = !entry.installable || Boolean(state.storageJob?.active);
           install.dataset.installable = String(Boolean(entry.installable));
@@ -5407,16 +5419,10 @@
           entry.kraken_restore_base ? "krakenRestoreConfirm" : null;
         if (confirmation && !await confirmAction(t(confirmation, { path: entry.path }))) return;
         try {
-          const response = await api("/packages/mount", { path: entry.path });
-          if (response.job_id) {
-            renderStorageJob(response);
-            scheduleStorageJobPoll();
-            focusControl($("cancelTransfer"));
-            return;
-          }
-          logActivity(t("packageMountQueued"));
-          toast(t("packageMountQueued"));
-          setTimeout(refreshAll, 1600);
+          const job = await api("/packages/mount", { path: entry.path });
+          renderStorageJob(job);
+          scheduleStorageJobPoll();
+          focusControl($("cancelTransfer"));
         } catch (error) { toast(errorMessage(error), true); }
       }
 

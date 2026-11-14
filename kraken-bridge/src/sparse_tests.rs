@@ -245,14 +245,14 @@ impl PRead for TestRead {
     }
 }
 
-fn with_digests(mut pkg: Vec<u8>) -> Vec<u8> {
+fn with_digests(mut pkg: Vec<u8>, content_id: &[u8; 36]) -> Vec<u8> {
     let cnt = get64(&pkg, 0x58) as usize;
     let bytes = (cnt - PAGE) / PAGE * 32;
     let table = 0x200;
     let imagedigs = 0x300;
     pkg.resize(cnt + (imagedigs + bytes).max(0x1000), 0);
     pkg[6] = 3;
-    pkg[cnt + 0x40..cnt + 0x64].copy_from_slice(b"EP0000-PPSA01234_00-SYNTHETICPACKAGE");
+    pkg[cnt + 0x40..cnt + 0x64].copy_from_slice(content_id);
     for (offset, value) in [(0x10, 1), (0x18, table), (table, 0x040a),
                             (table + 16, imagedigs), (table + 20, bytes)] {
         pkg[cnt + offset..cnt + offset + 4].copy_from_slice(&(value as u32).to_be_bytes());
@@ -292,10 +292,29 @@ fn make_patch(base: &[u8], target: &[u8]) -> TestRead {
 
 #[test]
 fn lih_reads_updated_asset_and_preserves_sparse_chunks() {
-    let base = with_digests(synthetic_pkg(BLOCK));
+    check_lih(b"EP0000-PPSA01234_00-SYNTHETICPACKAGE", b"russian audio data");
+}
+
+#[test]
+fn lih_applies_across_title_ids_and_rejects_another_title() {
+    let title = b"UP0001-PPSA54321_00-SYNTHETICPACKAGE";
+    let base = with_digests(synthetic_pkg(BLOCK), title);
+    let mut different = base.clone();
+    different[IMAGE..IMAGE + 18].copy_from_slice(b"updated game asset");
+    let target = with_digests(different, b"UP0001-PPSA54322_00-SYNTHETICPACKAGE");
+    let patch = make_patch(&base, &target);
+    let base = TestRead(base);
+    let result = super::lih::View::open(&base, base.0.len() as u64, &patch,
+                                       patch.0.len() as u64, || false, |_, _| {});
+    assert!(matches!(result, Err(Error::Unsupported(message)) if message.contains("content ID")));
+    check_lih(title, b"updated game asset");
+}
+
+fn check_lih(content_id: &[u8; 36], asset: &[u8; 18]) {
+    let base = with_digests(synthetic_pkg(BLOCK), content_id);
     let mut updated = base.clone();
-    updated[IMAGE..IMAGE + 18].copy_from_slice(b"russian audio data");
-    let target = with_digests(updated);
+    updated[IMAGE..IMAGE + asset.len()].copy_from_slice(asset);
+    let target = with_digests(updated, content_id);
     let patch = make_patch(&base, &target);
     let base_size = base.len() as u64;
     let patch_size = patch.0.len() as u64;
@@ -325,7 +344,7 @@ fn lih_reads_updated_asset_and_preserves_sparse_chunks() {
     assert_eq!(&volume[24..40], &manifest[24..40]);
     assert_eq!(volume.len(), 2 * PAGE + BLOCK);
     let offset = (loc & ((1 << 48) - 1)) as usize;
-    assert_eq!(&volume[offset..offset + 18], b"russian audio data");
+    assert_eq!(&volume[offset..offset + asset.len()], asset);
     let zero_offset = (zero_loc & ((1 << 48) - 1)) as usize;
     assert!(volume[zero_offset..zero_offset + BLOCK].iter().all(|byte| *byte == 0));
 
@@ -335,7 +354,7 @@ fn lih_reads_updated_asset_and_preserves_sparse_chunks() {
         .unwrap_err();
     assert!(err.contains("fails its LIH digest"), "{err}");
     assert!(io.files.is_empty());
-    io.pkg = with_digests(io.pkg);
+    io.pkg = with_digests(io.pkg, content_id);
     let err = prepare_patched(&reader, &patch, base_size, patch_size, 1, "base.pkg", |_, _, _| {}, || false)
         .unwrap_err();
     assert!(err.contains("blocks absent"), "{err}");

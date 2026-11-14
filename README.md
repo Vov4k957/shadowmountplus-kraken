@@ -190,6 +190,11 @@ Open **Installation** to browse available PS5 storage, USB/external drives, and 
 - **Manage files and destinations:** copy or move supported game sources, choose a writable destination, create a folder where permitted, and delete eligible files from the Installation browser with confirmation.
 - **Monitor operations:** view transfer or installation progress and cancel an active operation while it remains cancellable. Some final installation or deletion steps cannot be safely interrupted.
 
+Selecting **U** starts one cancellable job for the selected PKG. The mounted
+source is retained for registered games across restarts. Existing PKG lines
+in `manual.lst` can be removed from the manual source list. Library scans list
+already registered Kraken games using their stored source.
+
 For installed games, use the **Library** details to review updates and DLC and remove them individually. Deleting an installer `.pkg` file in **Installation** removes that file, **not** the already installed game. Conversely, uninstalling a game from **Library** does not automatically delete the original PKG installer.
 
 ### Backports: install, replace and remove

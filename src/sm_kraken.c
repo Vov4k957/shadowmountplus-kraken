@@ -55,7 +55,7 @@ typedef struct {
   int error;
   char output_path[MAX_PATH];
   const char *staging;
-  const sm_kraken_patch_job_t *job;
+  const sm_kraken_job_t *job;
 } cache_io_t;
 
 static bool join_path(const char *root, const char *name, char out[MAX_PATH]) {
@@ -161,6 +161,8 @@ bool sm_kraken_can_mount(const sm_pkg_info_t *info) {
 }
 
 bool sm_kraken_can_apply_patch(const sm_pkg_info_t *info) {
+  if (!info || !info->is_lih)
+    return false;
   int fd = open_source(info, PKG_KIND_PATCH);
   if (fd < 0)
     return false;
@@ -262,7 +264,7 @@ static bool cancelled(void *unused) {
 }
 
 static bool cache_cancelled(const cache_io_t *io) {
-  return cancelled(NULL) || (io->job && io->job->cancelled(io->job->ctx));
+  return cancelled(NULL) || io->job->cancelled(io->job->ctx);
 }
 
 static int patch_cancelled(void *context) {
@@ -300,8 +302,7 @@ static ssize_t patch_read(void *context, uint64_t offset, unsigned char *buffer,
 
 static void patch_progress(void *context, uint32_t phase, uint64_t done, uint64_t total) {
   const cache_io_t *io = context;
-  if (io->job)
-    io->job->progress(io->job->ctx, phase, done, total);
+  io->job->progress(io->job->ctx, phase, done, total);
 }
 
 static bool output_path(cache_io_t *io, const unsigned char *name, size_t length,
@@ -697,7 +698,7 @@ static bool publish_cache(const char *title_id, const char *staging,
 }
 
 static bool prepare_cache(const sm_pkg_info_t *info, const sm_pkg_info_t *patch,
-                          const sm_kraken_patch_job_t *job, char cache[MAX_PATH]) {
+                          const sm_kraken_job_t *job, char cache[MAX_PATH]) {
   if (!join_path(KRAKEN_CACHE, info->title_id, cache) || !sm_kraken_is_cache(cache))
     return false;
   char existing[MAX_PATH] = "", current[280], saved[280] = "", patch_signature[280] = "";
@@ -714,38 +715,17 @@ static bool prepare_cache(const sm_pkg_info_t *info, const sm_pkg_info_t *patch,
     return false;
 
   if (read_cache_marker(cache, existing, saved, sizeof(saved), &old_patch) &&
-      strcmp(existing, info->path) != 0) {
-    char registered[MAX_PATH];
-    struct stat other;
-    if (read_mount_link(info->title_id, registered, sizeof(registered)) &&
-        strcmp(registered, cache) == 0 && is_installed(info->title_id) &&
-        lstat(existing, &other) == 0) {
-      log_debug("  [KRAKEN] %s is already bound to %s", info->title_id, existing);
-      errno = EEXIST;
-      return false;
-    }
-  }
-  bool same_base = strcmp(existing, info->path) == 0;
-  if (same_base) {
+      strcmp(existing, info->path) == 0) {
     bool intact = sm_kraken_source_ready(cache) && directory_has_game_executable(cache);
-    if (!job && old_patch.path[0]) {
-      char selected[MAX_PATH];
-      bool registered = read_mount_link(info->title_id, selected, sizeof(selected)) &&
-                        strcmp(selected, cache) == 0 && is_installed(info->title_id);
-      // A patched cache contains all required patch bytes. Keep it across
-      // rescans while this title is registered. A new U registration can
-      // rebuild from the base after the old registration has been removed.
-      if (registered) {
-        if (!intact)
-          errno = ESTALE;
-        return intact;
-      }
-    }
     bool same_patch = patch ? strcmp(old_patch.path, patch->path) == 0 &&
                                   strcmp(old_patch.signature, patch_signature) == 0
                             : !old_patch.path[0];
-    if (intact && same_patch && strcmp(current, saved) == 0)
-      return true;
+    if (intact && same_patch && strcmp(current, saved) == 0) {
+      if (job->finalize(job->ctx))
+        return true;
+      errno = ECANCELED;
+      return false;
+    }
   }
 
   char backup_name[40];
@@ -851,7 +831,7 @@ static bool prepare_cache(const sm_pkg_info_t *info, const sm_pkg_info_t *patch,
         error = errno;
     }
   }
-  if (error == 0 && job && !job->finalize(job->ctx))
+  if (error == 0 && !job->finalize(job->ctx))
     error = ECANCELED;
   if (error == 0 && !publish_cache(info->title_id, staging, cache, backup))
     error = errno ? errno : EIO;
@@ -870,22 +850,20 @@ static bool prepare_cache(const sm_pkg_info_t *info, const sm_pkg_info_t *patch,
   return error == 0;
 }
 
-bool sm_kraken_prepare(const sm_pkg_info_t *info, char cache[MAX_PATH]) {
-  return prepare_cache(info, NULL, NULL, cache);
+bool sm_kraken_prepare_base(const sm_pkg_info_t *info, const sm_kraken_job_t *job,
+                            char cache[MAX_PATH]) {
+  return prepare_cache(info, NULL, job, cache);
 }
 
 bool sm_kraken_apply_patch(const sm_pkg_info_t *base, const sm_pkg_info_t *patch,
-                           const sm_kraken_patch_job_t *job) {
+                           const sm_kraken_job_t *job) {
   if (strcmp(base->title_id, patch->title_id) != 0 || !base->content_id[0] ||
       strcmp(base->content_id, patch->content_id) != 0) {
+    log_debug("  [KRAKEN] LIH identity mismatch: base=%s (%s), patch=%s (%s)",
+              base->title_id, base->content_id, patch->title_id, patch->content_id);
     errno = EINVAL;
     return false;
   }
   char cache[MAX_PATH];
   return prepare_cache(base, patch, job, cache);
-}
-
-bool sm_kraken_restore_base(const sm_pkg_info_t *base, const sm_kraken_patch_job_t *job) {
-  char cache[MAX_PATH];
-  return prepare_cache(base, NULL, job, cache);
 }

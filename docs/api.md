@@ -518,17 +518,20 @@ including patch progress and cancellation without uninstalling that base.
 
 A local plaintext PS5 debug base-game PKG may also have `mountable=true`.
 `POST /api/v1/packages/mount` accepts `{"path":"/mnt/usb0/packages/game.pkg"}` and
-returns HTTP 202 with `status`, `title_id` and `changed`. The scanner validates
-the package and registers it from its current path. An unsupported package
-returns HTTP 400, and a different source already registered for the Title ID
-returns HTTP 409.
+returns HTTP 202 with a storage job (`operation=mount_package`). It validates
+the selected package and registers it from its current path. Package mounts
+are one-shot jobs. The registered source is retained through `mount.lnk` and
+its cache marker. Existing `manual.lst` PKG entries are ignored by the scanner.
 
 A local debug LIH targeting a Kraken-mounted game can have `mount_patch=true`
 and `mountable=true`. Send its path to the same endpoint to start a
 cancellable storage job with `operation=mount_package`. Its `kraken_phase`
 tracks the update block check (0), base block check (1) and cache build (2).
 Compatibility is checked by content ID and the target image's block digests.
-The previous game remains usable if the operation fails. A successful patch
+These checks apply to any supported PS5 title. A patch targeting a
+Kraken-mounted game has `kraken_only=true` and uses this endpoint. The
+system installer uses a natively installed base. A failed patch leaves
+the previous cache available. A successful patch
 is marked `kraken_patch_applied=true`; applying the base path again when
 `kraken_restore_base=true` replaces the patched cache with the base.
 

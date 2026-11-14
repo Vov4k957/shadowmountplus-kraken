@@ -1088,18 +1088,11 @@ paths:
                 path: {type: string, example: /mnt/usb0/packages/game.pkg}
       responses:
         "202":
-          description: Base registration requested or update storage job accepted
+          description: One-shot base mount or LIH application job accepted
           content:
             application/json:
               schema:
-              oneOf:
-                - type: object
-                  required: [status, title_id, changed]
-                  properties:
-                    status: {type: integer, enum: [0]}
-                    title_id: {type: string}
-                    changed: {type: boolean, description: The source was new to the manual list}
-                - $ref: "#/components/schemas/StorageJobResponse"
+                $ref: "#/components/schemas/StorageJobResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "404":
@@ -2718,7 +2711,7 @@ components:
     OperationErrorReason:
       type: string
       description: Stable reason code for localized operation errors; empty for generic errno failures.
-      enum: ["", rest_mode, game_active, install_pending, runtime_prepared, scanner_busy, runtime_busy, title_unmount_busy, image_unmount_busy, unpack_mounted, storage_busy, storage_unavailable, usb_disk_busy, usb_mount_busy, usb_partition_busy, usb_image_busy, usb_mount_changed, usb_eject_unconfirmed, usb_eject_failed, pkg_invalid, pkg_base_missing, pkg_stream_lost, pkg_source_changed, pkg_already_installed, pkg_queued, pkg_queue_full, kraken_patch_invalid, kraken_base_missing]
+      enum: ["", rest_mode, game_active, install_pending, runtime_prepared, scanner_busy, runtime_busy, title_unmount_busy, image_unmount_busy, unpack_mounted, storage_busy, storage_unavailable, usb_disk_busy, usb_mount_busy, usb_partition_busy, usb_image_busy, usb_mount_changed, usb_eject_unconfirmed, usb_eject_failed, pkg_invalid, pkg_base_missing, pkg_stream_lost, pkg_source_changed, pkg_already_installed, pkg_queued, pkg_queue_full, kraken_patch_invalid, kraken_base_missing, kraken_base_invalid, kraken_title_conflict, kraken_use_mount, kraken_sources_changed]
 
     PackageListing:
       type: object
@@ -2763,6 +2756,7 @@ components:
               installed: {type: boolean, description: The base game is already installed as a native PKG.}
               mountable: {type: boolean, description: The local base or update can be selected for Kraken mounting. Full validation follows.}
               mount_patch: {type: boolean, description: The debug LIH is a candidate for an existing Kraken registration.}
+              kraken_only: {type: boolean, description: This LIH targets a mounted PKG. Native install requires a system-installed base.}
               kraken_patch_applied: {type: boolean, description: The current Kraken cache was built from this update.}
               kraken_restore_base: {type: boolean, description: Mounting this base again will remove the update from the Kraken cache.}
               replaceable: {type: boolean, description: Full media application remaster that can replace an existing native app.}
