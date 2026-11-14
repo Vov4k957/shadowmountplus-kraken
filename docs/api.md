@@ -523,6 +523,15 @@ the package and registers it from its current path. An unsupported package
 returns HTTP 400, and a different source already registered for the Title ID
 returns HTTP 409.
 
+A local debug LIH targeting a Kraken-mounted game can have `mount_patch=true`
+and `mountable=true`. Send its path to the same endpoint to start a
+cancellable storage job with `operation=mount_package`. Its `kraken_phase`
+tracks the update block check (0), base block check (1) and cache build (2).
+Compatibility is checked by content ID and the target image's block digests.
+The previous game remains usable if the operation fails. A successful patch
+is marked `kraken_patch_applied=true`; applying the base path again when
+`kraken_restore_base=true` replaces the patched cache with the base.
+
 `GET /api/v1/packages/icon?path=...&v=...` returns the embedded icon0.png from a
 permitted PKG, limited to 4 MiB. For a game directory, add `source_type=folder`
 and pass the directory as `path` to read its `sce_sys/icon0.png`, even before

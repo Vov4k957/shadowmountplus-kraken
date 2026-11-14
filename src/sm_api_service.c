@@ -103,6 +103,7 @@ typedef enum {
   GAME_STORAGE_UNPACK,
   GAME_STORAGE_INSTALL,
   GAME_STORAGE_EJECT,
+  GAME_STORAGE_MOUNT_PACKAGE,
 } game_storage_operation_t;
 
 typedef enum {
@@ -148,6 +149,7 @@ typedef struct {
   uint64_t transfer_finished_us;
   uint64_t finished_us;
   size_t affected_titles;
+  uint32_t kraken_phase;
   int result_status;
   char result_error_reason[32];
   usb_eject_blocker_t usb_blocker;
@@ -186,6 +188,7 @@ typedef struct {
   uint64_t transfer_finished_us;
   uint64_t finished_us;
   size_t affected_titles;
+  uint32_t kraken_phase;
   int result_status;
   char result_error_reason[32];
   usb_eject_blocker_t usb_blocker;
@@ -1347,6 +1350,11 @@ static struct json_object *game_to_json(
       metadata && metadata->title_name[0] != '\0' ? metadata->title_name
                                                   : source->title_name;
   const char *content_id = metadata ? metadata->content_id : "";
+  const char *version = metadata ? metadata->version : "";
+  sm_pkg_info_t mounted_pkg;
+  if (source_info.kraken && sm_pkg_read_directory_metadata(source->path, &mounted_pkg) &&
+      mounted_pkg.app_ver[0])
+    version = mounted_pkg.app_ver;
   const char *last_access_time = metadata ? metadata->last_access_time : "";
   const char *install_time = metadata ? metadata->install_time : "";
   const char *platform = game_platform_name(source->title_id, metadata);
@@ -1369,7 +1377,7 @@ static struct json_object *game_to_json(
       !add_json_string(item, "title_id", source->title_id) ||
       !add_json_string(item, "content_id", content_id) ||
       !add_json_string(item, "title_name", title_name) ||
-      !add_json_string(item, "version", metadata ? metadata->version : "") ||
+      !add_json_string(item, "version", version) ||
       !add_json_string(item, "last_access_time", last_access_time) ||
       !add_json_string(item, "install_time", install_time) ||
       !add_json_string(item, "icon_url", icon_url) ||
@@ -2211,6 +2219,8 @@ static const char *operation_error_message(int status, const char *reason) {
       {"pkg_already_installed", "the base game is already installed"},
       {"pkg_queued", "the package is already queued"},
       {"pkg_queue_full", "the installation queue is full (32 packages)"},
+      {"kraken_patch_invalid", "LIH update does not match a supported base PKG or failed validation; see the debug log"},
+      {"kraken_base_missing", "mount the matching base PKG with U first"},
   };
   if (reason && reason[0] != '\0') {
     for (size_t i = 0; i < sizeof(messages) / sizeof(messages[0]); ++i) {
@@ -3235,6 +3245,8 @@ static const char *game_storage_operation_name(
     return "install";
   case GAME_STORAGE_EJECT:
     return "eject";
+  case GAME_STORAGE_MOUNT_PACKAGE:
+    return "mount_package";
   }
   return "unknown";
 }
@@ -3562,6 +3574,7 @@ static void copy_storage_job_snapshot_locked(
   snapshot->transfer_finished_us = g_storage_job.transfer_finished_us;
   snapshot->finished_us = g_storage_job.finished_us;
   snapshot->affected_titles = g_storage_job.affected_titles;
+  snapshot->kraken_phase = g_storage_job.kraken_phase;
   snapshot->result_status = g_storage_job.result_status;
   (void)strlcpy(snapshot->result_error_reason, g_storage_job.result_error_reason,
                 sizeof(snapshot->result_error_reason));
@@ -3685,6 +3698,7 @@ static bool add_storage_job_fields(struct json_object *response,
                       (int64_t)storage_job_elapsed_ms(snapshot, now_us)) &&
          add_json_int(response, "affected_titles",
                       (int64_t)snapshot->affected_titles) &&
+         add_json_int(response, "kraken_phase", snapshot->kraken_phase) &&
          add_json_int(response, "result_status", snapshot->result_status) &&
          add_json_string(response, "result_error",
                          snapshot->result_status == 0
@@ -4071,6 +4085,85 @@ static void run_usb_eject_job(uint64_t job_id, const char *path,
   finish_storage_job(job_id, status, false, error);
 }
 
+static bool read_kraken_base_path(const char *title_id, char base[MAX_PATH]) {
+  char cache[MAX_PATH];
+  return read_mount_link(title_id, cache, sizeof(cache)) &&
+         sm_kraken_source(cache, base);
+}
+
+static void update_kraken_job(void *ctx, uint32_t phase, uint64_t done, uint64_t total) {
+  uint64_t job_id = (uint64_t)(uintptr_t)ctx;
+  pthread_mutex_lock(&g_storage_job.mutex);
+  if (g_storage_job.id == job_id && g_storage_job.state != STORAGE_JOB_FINALIZING) {
+    if (g_storage_job.state != STORAGE_JOB_TRANSFERRING || g_storage_job.kraken_phase != phase)
+      g_storage_job.transfer_started_us = monotonic_time_us();
+    g_storage_job.state = STORAGE_JOB_TRANSFERRING;
+    g_storage_job.kraken_phase = phase;
+    g_storage_job.processed_bytes = phase == 2u ? 0 : done;
+    g_storage_job.total_bytes = phase == 2u ? 0 : total;
+    g_storage_job.processed_files = phase == 2u ? done : 0;
+    g_storage_job.total_files = phase == 2u ? total : 0;
+  }
+  pthread_mutex_unlock(&g_storage_job.mutex);
+}
+
+static void run_kraken_job(uint64_t job_id, const char *title_id,
+                           const char *base_path, const char *patch_path) {
+  const char *error = runtime_mutation_block_reason();
+  bool scanner = false, runtime = false;
+  int status = error ? EBUSY : 0;
+  void *ctx = (void *)(uintptr_t)job_id;
+  if (!status && storage_job_cancelled(ctx))
+    status = ECANCELED;
+  if (!status && !(scanner = sm_scanner_try_begin_external_mutation())) {
+    status = EBUSY;
+    error = "scanner_busy";
+  }
+  if (!status && !(runtime = sm_shellcore_try_begin_external_mutation())) {
+    status = EBUSY;
+    error = "runtime_busy";
+  }
+  if (!status && (sm_shellcore_title_is_protected(title_id) ||
+      sm_shellcore_source_is_protected(base_path))) {
+    status = EBUSY;
+    error = "game_active";
+  }
+  char registered[MAX_PATH];
+  sm_pkg_info_t base, patch;
+  if (!status && (!is_installed(title_id) || !read_kraken_base_path(title_id, registered) ||
+      strcmp(registered, base_path) != 0 ||
+      !sm_pkg_parse_file(base_path, NULL, &base) || strcmp(title_id, base.title_id) != 0 ||
+      !sm_kraken_can_mount(&base))) {
+    status = ENOENT;
+    error = "kraken_base_missing";
+  }
+  if (!status && *patch_path && (!sm_pkg_parse_file(patch_path, NULL, &patch) ||
+      !sm_kraken_can_apply_patch(&patch) || strcmp(base.title_id, patch.title_id) != 0 ||
+      !base.content_id[0] || strcmp(base.content_id, patch.content_id) != 0)) {
+    status = EINVAL;
+    error = "kraken_patch_invalid";
+  }
+  if (!status) {
+    sm_kraken_patch_job_t job = {
+      .cancelled = storage_job_cancelled, .finalize = begin_storage_job_finalizing,
+      .progress = update_kraken_job, .ctx = ctx,
+    };
+    bool ready = *patch_path ? sm_kraken_apply_patch(&base, &patch, &job)
+                             : sm_kraken_restore_base(&base, &job);
+    if (!ready) {
+      status = errno ? errno : EIO;
+      if (*patch_path && status == EINVAL)
+        error = "kraken_patch_invalid";
+    }
+  }
+  if (runtime)
+    sm_shellcore_end_external_mutation();
+  if (scanner)
+    sm_scanner_end_external_mutation();
+  bool queued = status == 0 && request_scan_now("HTTP API refreshed mounted PKG");
+  finish_storage_job(job_id, status, queued, error);
+}
+
 static void *storage_job_thread_main(void *arg) {
   uint64_t job_id = (uint64_t)(uintptr_t)arg;
   char title_id[MAX_TITLE_ID];
@@ -4099,6 +4192,11 @@ static void *storage_job_thread_main(void *arg) {
 
   if (operation == GAME_STORAGE_EJECT) {
     run_usb_eject_job(job_id, source, runtime_source, usb_mount_id);
+    return NULL;
+  }
+  if (operation == GAME_STORAGE_MOUNT_PACKAGE) {
+    run_kraken_job(job_id, title_id, runtime_source,
+                   strcmp(source, runtime_source) ? source : "");
     return NULL;
   }
 
@@ -4393,6 +4491,7 @@ static int launch_storage_job(const char *title_id,
   g_storage_job.transfer_finished_us = 0;
   g_storage_job.finished_us = 0;
   g_storage_job.affected_titles = 0;
+  g_storage_job.kraken_phase = 0;
   g_storage_job.result_status = 0;
   g_storage_job.result_error_reason[0] = '\0';
   memset(&g_storage_job.usb_blocker, 0, sizeof(g_storage_job.usb_blocker));
@@ -4552,16 +4651,49 @@ static void handle_package_mount(struct MHD_Connection *connection,
   }
   sm_pkg_info_t info;
   if (!sm_kraken_is_package(source) || !sm_manual_normalize_path(source, manual) ||
-      strcmp(manual, source) != 0 || !sm_pkg_parse_file(source, NULL, &info) ||
-      !sm_kraken_can_mount(&info)) {
+      strcmp(manual, source) != 0 || !sm_pkg_parse_file(source, NULL, &info)) {
     send_error_response(connection, 400, ENOTSUP,
-                        "Mount requires a local plaintext PS5 debug base-game PKG");
+                        "Mount requires a local PS5 debug PKG");
     return;
   }
   char managed[MAX_PATH], backing[MAX_PATH];
   bool tracked = read_mount_link(info.title_id, managed, sizeof(managed));
   bool registered = is_installed(info.title_id);
   bool existing_kraken = tracked && sm_kraken_source(managed, backing);
+  if (info.pkg_kind == PKG_KIND_PATCH) {
+    if (!sm_kraken_can_apply_patch(&info)) {
+      send_operation_error_response(connection, EINVAL, "kraken_patch_invalid");
+      return;
+    }
+    if (!existing_kraken || !registered) {
+      send_operation_error_response(connection, ENOENT, "kraken_base_missing");
+      return;
+    }
+  } else if (!sm_kraken_can_mount(&info)) {
+    send_error_response(connection, 400, ENOTSUP,
+                        "Mount requires a local plaintext PS5 debug base-game PKG");
+    return;
+  }
+  char current_patch[MAX_PATH];
+  bool restore = existing_kraken && !strcmp(source, backing) &&
+                 sm_kraken_patch_source(managed, current_patch);
+  if (info.pkg_kind == PKG_KIND_PATCH || restore) {
+    const char *error = runtime_mutation_block_reason();
+    if (!error && sm_shellcore_title_is_protected(info.title_id))
+      error = "game_active";
+    game_source_info_t package = {0};
+    strlcpy(package.physical_path, source, sizeof(package.physical_path));
+    strlcpy(package.runtime_path, backing, sizeof(package.runtime_path));
+    strlcpy(package.source_type, "kraken", sizeof(package.source_type));
+    storage_job_snapshot_t accepted;
+    status = error ? EBUSY : launch_storage_job(info.title_id, &package, "",
+        GAME_STORAGE_MOUNT_PACKAGE, false, &accepted, &error);
+    if (status)
+      send_operation_error_response(connection, status, error);
+    else
+      send_storage_job_response(connection, 202, &accepted);
+    return;
+  }
   if ((tracked && !sm_kraken_is_cache(managed)) ||
       (registered && (!existing_kraken || (strcmp(source, backing) != 0 && path_exists(backing))))) {
     send_error_response(connection, 409, EEXIST, "The Title ID already has another game source");
@@ -4899,9 +5031,17 @@ static bool add_package_state(struct json_object *item, const sm_pkg_info_t *inf
   pthread_mutex_lock(&g_storage_job.mutex);
   bool queued_base = package_base_queued_locked(info->title_id);
   pthread_mutex_unlock(&g_storage_job.mutex);
+  char cache[MAX_PATH], backing[MAX_PATH], patch[MAX_PATH];
+  bool kraken = base && !pkg_installed && read_mount_link(info->title_id, cache, sizeof(cache)) &&
+                sm_kraken_source(cache, backing);
+  bool mount_patch = kraken && sm_kraken_can_apply_patch(info);
+  bool patched = kraken && sm_kraken_patch_source(cache, patch);
   return add_json_bool(item, "installed", info->pkg_kind == PKG_KIND_BASE && pkg_installed) &&
     add_json_bool(item, "base_installed", base) && add_json_bool(item, "base_queued", queued_base) &&
-    add_json_bool(item, "mountable", sm_kraken_can_mount(info)) &&
+    add_json_bool(item, "mountable", mount_patch || sm_kraken_can_mount(info)) &&
+    add_json_bool(item, "mount_patch", mount_patch) &&
+    add_json_bool(item, "kraken_patch_applied", patched && !strcmp(info->path, patch)) &&
+    add_json_bool(item, "kraken_restore_base", patched && !strcmp(info->path, backing)) &&
     add_package_icon_info(item, info);
 }
 

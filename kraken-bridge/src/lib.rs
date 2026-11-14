@@ -5,13 +5,14 @@ extern crate alloc;
 
 #[path = "../../vendor/kraken/src/ampr_index.rs"]
 mod ampr_index;
+mod lih;
 
 use alloc::{collections::BTreeMap, format, string::String, vec, vec::Vec};
 use ampr_index::{Chunk, IndexFile, Kraken};
 use core::{ffi::c_void, ptr, slice, str};
 #[cfg(not(test))]
 use core::{alloc::{GlobalAlloc, Layout}, panic::PanicInfo};
-use kraken_mount_pkg::{Entry, PRead, Pkg};
+use kraken_mount_pkg::{Block, Entry, Error, PRead, Pkg};
 
 const COPY_BUFFER: usize = 1024 * 1024;
 const REQUIRED_FILES: [&str; 3] = ["eboot.bin", "sce_sys/param.json", "sce_sys/icon0.png"];
@@ -67,6 +68,7 @@ mod sparse_tests;
 type Read = unsafe extern "C" fn(*mut c_void, u64, *mut u8, usize) -> isize;
 type Write = unsafe extern "C" fn(*mut c_void, *const u8, usize, u64, *const u8, usize) -> i32;
 type LooseSize = unsafe extern "C" fn(*mut c_void, *const u8, usize, *mut u64) -> i32;
+type Progress = unsafe extern "C" fn(*mut c_void, u32, u64, u64);
 
 struct PackageIo {
     context: *mut c_void,
@@ -77,9 +79,20 @@ struct PackageIo {
 
 impl PRead for PackageIo {
     fn pread(&self, offset: u64, buf: &mut [u8]) -> Result<usize, kraken_mount_pkg::Error> {
+        CallbackReader { context: self.context, read: self.read }.pread(offset, buf)
+    }
+}
+
+struct CallbackReader {
+    context: *mut c_void,
+    read: Read,
+}
+
+impl PRead for CallbackReader {
+    fn pread(&self, offset: u64, buf: &mut [u8]) -> Result<usize, Error> {
         let count = unsafe { (self.read)(self.context, offset, buf.as_mut_ptr(), buf.len()) };
         if count < 0 || count as usize > buf.len() {
-            return Err(kraken_mount_pkg::Error::Io(count.saturating_neg() as i32));
+            return Err(Error::Io(count.saturating_neg() as i32));
         }
         Ok(count as usize)
     }
@@ -103,13 +116,14 @@ impl PackageIo {
         }
     }
 
-    fn extract(&self, pkg: &Pkg, entry: &Entry<'_>, path: &str, buf: &mut [u8]) -> Result<(), String> {
+    fn extract(&self, reader: &impl PRead, pkg: &Pkg, entry: &Entry<'_>, path: &str,
+               buf: &mut [u8]) -> Result<(), String> {
         if entry.size == 0 {
             return self.output(path, 0, &[]);
         }
         let mut offset = 0;
         while offset < entry.size {
-            let length = pkg.read_at(self, entry, offset, buf).map_err(|e| format!("{path}: {e}"))?;
+            let length = pkg.read_at(reader, entry, offset, buf).map_err(|e| format!("{path}: {e}"))?;
             if length == 0 || length as u64 > entry.size - offset {
                 return Err(format!("{path}: short package read"));
             }
@@ -120,8 +134,92 @@ impl PackageIo {
     }
 }
 
+fn original_chunk(block: &Block, offset: u64) -> Chunk {
+    Chunk {
+        pkg_off: offset,
+        stored_len: block.stored_len,
+        raw_len: block.raw_len,
+        staged: false,
+        kraken: block.compressed.then_some(Kraken { even_len: block.desc.even_len, mode: block.desc.mode }),
+    }
+}
+
+struct PatchCache<'a> {
+    io: &'a PackageIo,
+    end: u64,
+}
+
+impl PatchCache<'_> {
+    fn append(&mut self, bytes: &[u8]) -> Result<Chunk, String> {
+        let offset = self.end;
+        self.end += (bytes.len() as u64).next_multiple_of(ampr_index::PAGE);
+        let len = bytes.len() as u32;
+        self.io.output(ampr_index::PATCH_PACK_NAME, offset, bytes)?;
+        if bytes.len() as u64 % ampr_index::PAGE != 0 {
+            self.io.output(ampr_index::PATCH_PACK_NAME, self.end - 1, &[0])?;
+        }
+        Ok(Chunk { pkg_off: offset, stored_len: len, raw_len: len, staged: true, kraken: None })
+    }
+}
+
 fn prepare(io: &PackageIo, size: u64, mtime: i64, basename: &str) -> Result<(), String> {
     let pkg = Pkg::open(io, size).map_err(|e| format!("{e}"))?;
+    prepare_package(io, io, &pkg, size, mtime, basename, |_, _| {}, |_, entry, _, _| {
+        let blocks = pkg.blocks(entry).map_err(|e| format!("{e}"))?;
+        Ok(blocks.iter().map(|block| original_chunk(block, block.pkg_off)).collect())
+    })
+}
+
+fn prepare_patched(io: &PackageIo, patch: &impl PRead, size: u64, patch_size: u64, mtime: i64,
+                   basename: &str, progress: impl Fn(u32, u64, u64),
+                   cancelled: impl Fn() -> bool) -> Result<(), String> {
+    let view = lih::View::open(io, size, patch, patch_size, &cancelled,
+                               |done, total| progress(0, done, total)).map_err(|e| format!("{e}"))?;
+    view.verify_base(|done, total| progress(1, done, total)).map_err(|e| format!("{e}"))?;
+    let pkg = Pkg::open(&view, view.len()).map_err(|e| format!("{e}"))?;
+    prepare_package(io, &view, &pkg, size, mtime, basename,
+                    |done, total| progress(2, done, total), |pkg, entry, cache, buffer| {
+        if cancelled() {
+            return Err(String::from("LIH cache build cancelled"));
+        }
+        let blocks = pkg.blocks(entry).ok();
+        let mut chunks = Vec::new();
+        for (i, offset) in (0..entry.size).step_by(ampr_index::BLOCK as usize).enumerate() {
+            let want = (entry.size - offset).min(ampr_index::BLOCK);
+            if let Some(block) = blocks.and_then(|blocks| blocks.get(i)) {
+                if u64::from(block.raw_len) >= want && u64::from(block.raw_len) <= ampr_index::BLOCK {
+                    if block.stored_len == 0 {
+                        chunks.push(original_chunk(block, 0));
+                        continue;
+                    }
+                    let run = view.locate(block.pkg_off).map_err(|e| format!("{}: {e}", entry.path))?;
+                    if run.source == lih::Source::Base && run.len >= u64::from(block.stored_len) {
+                        chunks.push(original_chunk(block, run.offset));
+                        continue;
+                    }
+                }
+            }
+            let buffer = &mut buffer[..want as usize];
+            let count = pkg.read_at(&view, entry, offset, buffer)
+                .map_err(|e| format!("{}: {e}", entry.path))?;
+            if count != buffer.len() {
+                return Err(format!("{}: short LIH file read", entry.path));
+            }
+            if buffer.iter().all(|&byte| byte == 0) {
+                chunks.push(Chunk { pkg_off: 0, stored_len: 0, raw_len: count as u32, staged: false, kraken: None });
+            } else {
+                chunks.push(cache.append(buffer)?);
+            }
+        }
+        Ok(chunks)
+    })
+}
+
+fn prepare_package(
+    io: &PackageIo, reader: &impl PRead, pkg: &Pkg, size: u64, mtime: i64, basename: &str,
+    progress: impl Fn(u64, u64),
+    mut chunks_for_file: impl FnMut(&Pkg, &Entry<'_>, &mut PatchCache<'_>, &mut [u8]) -> Result<Vec<Chunk>, String>,
+) -> Result<(), String> {
     for path in REQUIRED_FILES {
         if !pkg.lookup(path).is_some_and(|entry| !entry.is_dir && entry.size > 0) {
             return Err(format!("base game file {path} is missing"));
@@ -129,12 +227,15 @@ fn prepare(io: &PackageIo, size: u64, mtime: i64, basename: &str) -> Result<(), 
     }
     let mut buffer = vec![0; COPY_BUFFER];
     let mut files = BTreeMap::new();
+    let mut cache = PatchCache { io, end: ampr_index::PAGE };
+    let total = pkg.files().filter(|entry| !entry.is_dir).count() as u64;
     let primary_lib = if pkg.files().any(|f| !f.is_dir && f.path.to_ascii_lowercase().starts_with("fakelib2/")) {
         "fakelib2/"
     } else {
         "fakelib/"
     };
-    for entry in pkg.files().filter(|f| !f.is_dir) {
+    for (i, entry) in pkg.files().filter(|f| !f.is_dir).enumerate() {
+        progress(i as u64, total);
         ampr_index::check_path(entry.path)?;
         let lower = entry.path.to_ascii_lowercase();
         if let Some(name) = lower.strip_prefix(primary_lib) {
@@ -142,7 +243,7 @@ fn prepare(io: &PackageIo, size: u64, mtime: i64, basename: &str) -> Result<(), 
                 let name = &entry.path[primary_lib.len()..];
                 let out = format!("fakelib2/{name}");
                 if io.override_size(&out)?.is_none() {
-                    io.extract(&pkg, &entry, &out, &mut buffer)?;
+                    io.extract(reader, pkg, &entry, &out, &mut buffer)?;
                 }
             }
             continue;
@@ -165,28 +266,36 @@ fn prepare(io: &PackageIo, size: u64, mtime: i64, basename: &str) -> Result<(), 
         let (length, chunks) = if let Some(length) = loose {
             (length, None)
         } else if extract {
-            io.extract(&pkg, &entry, entry.path, &mut buffer)?;
+            io.extract(reader, pkg, &entry, entry.path, &mut buffer)?;
             (entry.size, None)
         } else {
-            let blocks = pkg.blocks(&entry).map_err(|e| format!("{e}"))?;
-            let chunks = blocks.iter().map(|block| Chunk {
-                pkg_off: block.pkg_off,
-                stored_len: block.stored_len,
-                raw_len: block.raw_len,
-                kraken: block.compressed.then_some(Kraken { even_len: block.desc.even_len, mode: block.desc.mode }),
-            }).collect();
+            let chunks = chunks_for_file(pkg, &entry, &mut cache, &mut buffer)?;
             (entry.size, Some(chunks))
         };
         files.insert(lower, IndexFile { path: String::from(entry.path), size: length, chunks });
     }
     let files: Vec<_> = files.into_values().collect();
-    let images = ampr_index::build(size, mtime, &files)?;
+    let images = ampr_index::build(size, mtime, &files, cache.end)?;
     if let Some((name, bytes)) = images.zero_pack {
         io.output(name, 0, &bytes)?;
+    }
+    if let Some((header, size)) = images.patch_volume {
+        if size > cache.end {
+            io.output(ampr_index::PATCH_PACK_NAME, size - 1, &[0])?;
+        }
+        io.output(ampr_index::PATCH_PACK_NAME, 0, &header)?;
     }
     io.output("ampr_emu.index", 0, &images.index)?;
     io.output("ampr_assets.index", 0, &images.manifest)?;
     io.output("kraken.image", 0, format!("kraken/{basename}").as_bytes())
+}
+
+fn package_basename(bytes: &[u8]) -> Result<&str, String> {
+    let name = str::from_utf8(bytes).map_err(|_| String::from("package basename must be UTF-8"))?;
+    if name.is_empty() || name.len() > 255 || name.contains(['/', '\\', '\r', '\n', '\0']) {
+        return Err(String::from("invalid package basename"));
+    }
+    Ok(name)
 }
 
 /// C retains ownership of the context and buffers for the duration of this call.
@@ -196,14 +305,29 @@ pub unsafe extern "C" fn sm_kraken_build_index(
     read: Read, write: Write, loose_size: LooseSize, error: *mut u8, error_len: usize,
 ) -> i32 {
     let io = PackageIo { context, read, write, loose_size };
-    let result = str::from_utf8(unsafe { slice::from_raw_parts(basename, basename_len) })
-        .map_err(|_| String::from("package basename must be UTF-8"))
-        .and_then(|name| {
-            if name.is_empty() || name.len() > 255 || name.contains(['/', '\\', '\r', '\n', '\0']) {
-                return Err(String::from("invalid package basename"));
-            }
-            prepare(&io, size, mtime, name)
-        });
+    let result = package_basename(unsafe { slice::from_raw_parts(basename, basename_len) })
+        .and_then(|name| prepare(&io, size, mtime, name));
+    unsafe { report_result(result, error, error_len) }
+}
+
+/// Build a cache for a base PKG and one compatible debug LIH.
+#[no_mangle]
+pub unsafe extern "C" fn sm_kraken_build_patched_index(
+    context: *mut c_void, size: u64, patch_size: u64, mtime: i64, basename: *const u8,
+    basename_len: usize, read: Read, read_patch: Read, write: Write, loose_size: LooseSize,
+    progress: Progress, is_cancelled: unsafe extern "C" fn(*mut c_void) -> i32,
+    error: *mut u8, error_len: usize,
+) -> i32 {
+    let io = PackageIo { context, read, write, loose_size };
+    let patch = CallbackReader { context, read: read_patch };
+    let result = package_basename(unsafe { slice::from_raw_parts(basename, basename_len) })
+        .and_then(|name| prepare_patched(&io, &patch, size, patch_size, mtime, name,
+            |phase, done, total| unsafe { progress(context, phase, done, total) },
+            || unsafe { is_cancelled(context) != 0 }));
+    unsafe { report_result(result, error, error_len) }
+}
+
+unsafe fn report_result(result: Result<(), String>, error: *mut u8, error_len: usize) -> i32 {
     match result {
         Ok(()) => 0,
         Err(msg) => {

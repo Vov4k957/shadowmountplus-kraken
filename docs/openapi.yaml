@@ -1075,7 +1075,7 @@ paths:
   /api/v1/packages/mount:
     post:
       operationId: mountDebugPackage
-      summary: Register a native plaintext PS5 debug base-game package for Kraken mounting
+      summary: Register a debug PKG or apply a compatible LIH update to a mounted base
       tags: [Packages]
       requestBody:
         required: true
@@ -1088,18 +1088,22 @@ paths:
                 path: {type: string, example: /mnt/usb0/packages/game.pkg}
       responses:
         "202":
-          description: Added to the manual source list and a scan was requested
+          description: Base registration requested or update storage job accepted
           content:
             application/json:
               schema:
-                type: object
-                required: [status, title_id, changed]
-                properties:
-                  status: {type: integer, enum: [0]}
-                  title_id: {type: string}
-                  changed: {type: boolean, description: The source was new to the manual list}
+              oneOf:
+                - type: object
+                  required: [status, title_id, changed]
+                  properties:
+                    status: {type: integer, enum: [0]}
+                    title_id: {type: string}
+                    changed: {type: boolean, description: The source was new to the manual list}
+                - $ref: "#/components/schemas/StorageJobResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "404":
+          description: No Kraken base is registered for this update
         "409":
           description: A different source already owns the Title ID
 
@@ -2478,7 +2482,7 @@ components:
           minimum: 0
         operation:
           type: string
-          enum: ["", move, copy, delete, unpack, install, eject]
+          enum: ["", move, copy, delete, unpack, install, eject, mount_package]
         state:
           type: string
           enum: [idle, preparing, measuring, transferring, deleting, finalizing, installing, completed, failed, cancelled]
@@ -2502,7 +2506,7 @@ components:
         package_kind: {type: string, enum: [unknown, base, patch, dlc]}
         source_type:
           type: string
-          enum: ["", folder, image, pkg, stream, backport, usb]
+          enum: ["", folder, image, pkg, stream, backport, usb, kraken]
         source:
           type: string
         runtime_source:
@@ -2546,6 +2550,10 @@ components:
         affected_titles:
           type: integer
           minimum: 0
+        kraken_phase:
+          type: integer
+          enum: [0, 1, 2]
+          description: For a mount_package job, 0 checks patch bytes, 1 checks base bytes, and 2 builds the cache.
         result_status:
           type: integer
           minimum: 0
@@ -2710,7 +2718,7 @@ components:
     OperationErrorReason:
       type: string
       description: Stable reason code for localized operation errors; empty for generic errno failures.
-      enum: ["", rest_mode, game_active, install_pending, runtime_prepared, scanner_busy, runtime_busy, title_unmount_busy, image_unmount_busy, unpack_mounted, storage_busy, storage_unavailable, usb_disk_busy, usb_mount_busy, usb_partition_busy, usb_image_busy, usb_mount_changed, usb_eject_unconfirmed, usb_eject_failed, pkg_invalid, pkg_base_missing, pkg_stream_lost, pkg_source_changed, pkg_already_installed, pkg_queued, pkg_queue_full]
+      enum: ["", rest_mode, game_active, install_pending, runtime_prepared, scanner_busy, runtime_busy, title_unmount_busy, image_unmount_busy, unpack_mounted, storage_busy, storage_unavailable, usb_disk_busy, usb_mount_busy, usb_partition_busy, usb_image_busy, usb_mount_changed, usb_eject_unconfirmed, usb_eject_failed, pkg_invalid, pkg_base_missing, pkg_stream_lost, pkg_source_changed, pkg_already_installed, pkg_queued, pkg_queue_full, kraken_patch_invalid, kraken_base_missing]
 
     PackageListing:
       type: object
@@ -2753,7 +2761,10 @@ components:
               sdk_version: {type: integer, minimum: 0, maximum: 4294967295, description: Packed SDK from param.json/param.sfo for PKGs and game directories or the backport eboot.bin process parameter; zero when unavailable.}
               kind: {type: string, enum: [base, patch, dlc, unknown]}
               installed: {type: boolean, description: The base game is already installed as a native PKG.}
-              mountable: {type: boolean, description: The local base-game package has a plaintext PS5 debug header. The scanner performs full validation.}
+              mountable: {type: boolean, description: The local base or update can be selected for Kraken mounting. Full validation follows.}
+              mount_patch: {type: boolean, description: The debug LIH is a candidate for an existing Kraken registration.}
+              kraken_patch_applied: {type: boolean, description: The current Kraken cache was built from this update.}
+              kraken_restore_base: {type: boolean, description: Mounting this base again will remove the update from the Kraken cache.}
               replaceable: {type: boolean, description: Full media application remaster that can replace an existing native app.}
               base_installed: {type: boolean, description: A base game is registered from a PKG or a folder/image source.}
               base_queued: {type: boolean}

@@ -2,7 +2,10 @@ use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::{ptr, slice, str};
 
-use super::{prepare, PackageIo, Pkg};
+use kraken_mount_pkg::{Error, PRead};
+use sha3::{Digest, Sha3_256};
+
+use super::{prepare, prepare_patched, PackageIo, Pkg};
 
 const PAGE: usize = 0x1_0000;
 const BLOCK: usize = 4 * PAGE;
@@ -176,8 +179,10 @@ unsafe extern "C" fn write(context: *mut c_void, name: *const u8, name_len: usiz
     let name = str::from_utf8(unsafe { slice::from_raw_parts(name, name_len) }).unwrap();
     let file = io.files.entry(name.into()).or_default();
     let end = offset as usize + size;
-    file.resize(end, 0);
-    file[offset as usize..].copy_from_slice(unsafe { slice::from_raw_parts(data, size) });
+        if end > file.len() {
+            file.resize(end, 0);
+        }
+    file[offset as usize..end].copy_from_slice(unsafe { slice::from_raw_parts(data, size) });
     0
 }
 
@@ -227,4 +232,112 @@ fn sparse_pkg_uses_a_shared_zero_volume() {
             assert!(volume[offset..offset + size].iter().all(|&byte| byte == 0));
         }
     }
+}
+
+struct TestRead(Vec<u8>);
+
+impl PRead for TestRead {
+    fn pread(&self, off: u64, buf: &mut [u8]) -> Result<usize, Error> {
+        let Some(bytes) = self.0.get(off as usize..) else { return Ok(0) };
+        let len = bytes.len().min(buf.len());
+        buf[..len].copy_from_slice(&bytes[..len]);
+        Ok(len)
+    }
+}
+
+fn with_digests(mut pkg: Vec<u8>) -> Vec<u8> {
+    let cnt = get64(&pkg, 0x58) as usize;
+    let bytes = (cnt - PAGE) / PAGE * 32;
+    let table = 0x200;
+    let imagedigs = 0x300;
+    pkg.resize(cnt + (imagedigs + bytes).max(0x1000), 0);
+    pkg[6] = 3;
+    pkg[cnt + 0x40..cnt + 0x64].copy_from_slice(b"EP0000-PPSA01234_00-SYNTHETICPACKAGE");
+    for (offset, value) in [(0x10, 1), (0x18, table), (table, 0x040a),
+                            (table + 16, imagedigs), (table + 20, bytes)] {
+        pkg[cnt + offset..cnt + offset + 4].copy_from_slice(&(value as u32).to_be_bytes());
+    }
+    for i in 0..bytes / 32 {
+        let at = PAGE + i * PAGE;
+        let mut hash: [u8; 32] = Sha3_256::digest(&pkg[at..at + PAGE]).into();
+        hash.reverse();
+        let offset = cnt + imagedigs + i * 32;
+        pkg[offset..offset + 32].copy_from_slice(&hash);
+    }
+    pkg
+}
+
+fn make_patch(base: &[u8], target: &[u8]) -> TestRead {
+    let cnt = get64(target, 0x58) as usize;
+    let mut patch = vec![0; PAGE];
+    patch[..4].copy_from_slice(b"\x7fLIH");
+    patch[6] = 1;
+    put64(&mut patch, 0x20, PAGE as u64);
+    put64(&mut patch, 0x28, PAGE as u64);
+    patch.extend_from_slice(&target[..PAGE]);
+    for (i, bytes) in target[PAGE..cnt].chunks_exact(PAGE).enumerate() {
+        let at = PAGE + i * PAGE;
+        if base.get(at..at + PAGE) != Some(bytes) {
+            patch.extend_from_slice(bytes);
+        }
+    }
+    let stored_end = patch.len() as u64;
+    patch.extend_from_slice(&target[cnt..]);
+    let total = patch.len() as u64;
+    put64(&mut patch, 0x18, total);
+    put64(&mut patch, 0x30, stored_end);
+    put64(&mut patch, 0x38, (target.len() - cnt) as u64);
+    TestRead(patch)
+}
+
+#[test]
+fn lih_reads_updated_asset_and_preserves_sparse_chunks() {
+    let base = with_digests(synthetic_pkg(BLOCK));
+    let mut updated = base.clone();
+    updated[IMAGE..IMAGE + 18].copy_from_slice(b"russian audio data");
+    let target = with_digests(updated);
+    let patch = make_patch(&base, &target);
+    let base_size = base.len() as u64;
+    let patch_size = patch.0.len() as u64;
+    let mut io = TestIo { pkg: base, files: BTreeMap::new() };
+    let reader = PackageIo { context: ptr::from_mut(&mut io).cast(), read, write, loose_size };
+    let view = super::lih::View::open(&reader, base_size, &patch, patch_size, || false, |_, _| {}).unwrap();
+    let mut result = vec![0; target.len()];
+    assert_eq!(view.pread(0, &mut result).unwrap(), target.len());
+    assert_eq!(result, target);
+    let phases = std::cell::Cell::new(0);
+    prepare_patched(&reader, &patch, base_size, patch_size, 1, "base.pkg", |phase, _, _| {
+        phases.set(phases.get() | 1 << phase);
+    }, || false).unwrap();
+    assert_eq!(phases.get(), 0b111);
+    assert_eq!(io.files["eboot.bin"], b"synthetic executable");
+    assert_eq!(io.files["kraken.image"], b"kraken/base.pkg");
+    assert!(!io.files.contains_key("other.bin"));
+    let manifest = &io.files["ampr_assets.index"];
+    assert_eq!(get32(manifest, 56), 2);
+    let chunks = get64(manifest, 80) as usize;
+    let loc = get64(manifest, chunks);
+    let zero_loc = get64(manifest, chunks + 12);
+    assert_eq!(loc >> 48, 1);
+    assert_eq!(zero_loc >> 48, 1);
+    let volume = &io.files[".smp-kraken-patch.pak"];
+    assert_eq!(&volume[..8], b"AMPRDAT3");
+    assert_eq!(&volume[24..40], &manifest[24..40]);
+    assert_eq!(volume.len(), 2 * PAGE + BLOCK);
+    let offset = (loc & ((1 << 48) - 1)) as usize;
+    assert_eq!(&volume[offset..offset + 18], b"russian audio data");
+    let zero_offset = (zero_loc & ((1 << 48) - 1)) as usize;
+    assert!(volume[zero_offset..zero_offset + BLOCK].iter().all(|byte| *byte == 0));
+
+    io.pkg[3 * PAGE + 500] ^= 1;
+    io.files.clear();
+    let err = prepare_patched(&reader, &patch, base_size, patch_size, 1, "base.pkg", |_, _, _| {}, || false)
+        .unwrap_err();
+    assert!(err.contains("fails its LIH digest"), "{err}");
+    assert!(io.files.is_empty());
+    io.pkg = with_digests(io.pkg);
+    let err = prepare_patched(&reader, &patch, base_size, patch_size, 1, "base.pkg", |_, _, _| {}, || false)
+        .unwrap_err();
+    assert!(err.contains("blocks absent"), "{err}");
+    assert!(io.files.is_empty());
 }

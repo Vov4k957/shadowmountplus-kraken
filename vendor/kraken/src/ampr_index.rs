@@ -27,6 +27,8 @@ pub struct Chunk {
     pub pkg_off: u64,
     pub stored_len: u32,
     pub raw_len: u32,
+    /// Decoded bytes staged because the original package cannot supply this run.
+    pub staged: bool,
     /// None: plain bytes, or a sparse block when stored_len is zero. Some: a compressed block.
     pub kraken: Option<Kraken>,
 }
@@ -41,7 +43,8 @@ pub struct Kraken {
 const APP0: &str = "/app0/";
 const PKG_NAME: &str = "kraken.pkg";
 const ZERO_PACK_NAME: &str = ".smp-kraken-zero.pak";
-const ZERO_PACK_ID: u32 = 1;
+pub const PATCH_PACK_NAME: &str = ".smp-kraken-patch.pak";
+const AUX_PACK_ID: u32 = 1;
 
 // AMPRIDX3 (ampr-format index.rs, dump-forge's ampr_index.rs).
 const IDX_MAGIC: &[u8; 8] = b"AMPRIDX3";
@@ -70,10 +73,10 @@ const CHUNK_PAGE_CONTAINED: u8 = 4;
 const CHUNK_PAGE_ALIGNED: u8 = 8;
 const PACK_IO_PAGE_LAYOUT: u32 = 2;
 /// io_page_size of the volume; the payload starts one page in (payload_offset >= DAT_HEADER).
-const PAGE: u64 = 65536; // 64 KiB, measured best (pkg game wait/read: 4 KiB 4.14 ms, 16 KiB 3.33, 64 KiB 2.48-2.62, 256 KiB 2.93-3.31; 256 KiB reads ~35-50% more bytes)
+pub const PAGE: u64 = 65536; // I/O page size and first payload offset.
 /// One chunk per Kraken block: block_shift 18 = 256 KiB (`decoder::BLOCK`).
 const BLOCK_SHIFT: u32 = 18;
-const BLOCK: u64 = 1 << BLOCK_SHIFT;
+pub const BLOCK: u64 = 1 << BLOCK_SHIFT;
 const OFFSET_LIMIT: u64 = 1 << 48;
 const KRAKEN_OFFSET_LIMIT: u64 = 1 << 40;
 const PATH_MAX: usize = 1024;
@@ -195,7 +198,7 @@ struct Plan {
 /// ceil(size / block), chunk i decodes to min(block, size - i * block) bytes). A RAW tail block
 /// past the file's end is cut to the file; a KRAKEN one is a full 256 KiB block decoded whole
 /// (CHUNK_KRAKEN_FULL). `vol_size` is the page-rounded volume size.
-fn plan(path: &str, size: u64, blocks: &[Chunk], vol_size: u64) -> Result<Plan> {
+fn plan(path: &str, size: u64, blocks: &[Chunk], vol_size: u64, aux_size: u64, zero_at: u64) -> Result<Plan> {
     let fail = |at: u64, why: &str| bad(format!("{path}: block at pkg offset {at:#x}: {why}"));
     if blocks.len() as u64 != size.div_ceil(BLOCK) {
         return Err(bad(format!("{path}: {} blocks for {size} bytes, want 256 KiB blocks", blocks.len())));
@@ -209,7 +212,7 @@ fn plan(path: &str, size: u64, blocks: &[Chunk], vol_size: u64) -> Result<Plan> 
         }
         if c.stored_len == 0 && c.kraken.is_none() {
             // Every sparse chunk can read a prefix of the same page-aligned block of zeros.
-            let loc = (u64::from(ZERO_PACK_ID) << 48) | PAGE;
+            let loc = (u64::from(AUX_PACK_ID) << 48) | zero_at;
             let flags = CHUNK_PAGE_ALIGNED | if want <= PAGE { CHUNK_PAGE_CONTAINED } else { 0 };
             chunks.push((loc, (want as u32 - 1) | u32::from(flags) << 22));
             continue;
@@ -236,7 +239,10 @@ fn plan(path: &str, size: u64, blocks: &[Chunk], vol_size: u64) -> Result<Plan> 
         };
         let end = at.checked_add(stored).ok_or_else(|| fail(at, "offset overflow"))?;
         let limit = if codec == CHUNK_KRAKEN { KRAKEN_OFFSET_LIMIT } else { OFFSET_LIMIT };
-        if at < PAGE || end > vol_size || end >= limit {
+        let volume_size = if c.staged { aux_size } else { vol_size };
+        if at < PAGE || end > volume_size || end >= limit ||
+            c.staged && (codec != CHUNK_RAW || at % PAGE != 0)
+        {
             return Err(fail(at, "outside the packable volume range"));
         }
         let contained = stored <= PAGE && at / PAGE == (end - 1) / PAGE;
@@ -246,7 +252,8 @@ fn plan(path: &str, size: u64, blocks: &[Chunk], vol_size: u64) -> Result<Plan> 
         // files STREAMING keeps ng's decoded cache on for them (caches.rs refuses STREAMING).
         flags |= if contained { CHUNK_PAGE_CONTAINED } else { 0 } | if aligned { CHUNK_PAGE_ALIGNED } else { 0 };
         let desc = (stored as u32 - 1) | codec << 20 | u32::from(flags) << 22;
-        chunks.push((loc, desc));
+        let pack_id = if c.staged { u64::from(AUX_PACK_ID) } else { 0 };
+        chunks.push((loc | pack_id << 48, desc));
     }
     Ok(Plan { chunks, flags: FILE_PACKED })
 }
@@ -261,28 +268,25 @@ fn write_pack_record(record: &mut [u8], payload_len: u64, name_at: u32, name_len
 }
 
 /// A regular AMPRDAT3 volume that supplies zeros for all sparse chunks.
-fn zero_volume(build_id: &[u8]) -> Vec<u8> {
-    let mut volume = vec![0; (PAGE + BLOCK) as usize];
-    let header = &mut volume[..DAT_HEADER];
+fn aux_header(build_id: &[u8], payload_len: u64) -> Vec<u8> {
+    let mut header = vec![0; DAT_HEADER];
     header[..8].copy_from_slice(b"AMPRDAT3");
-    put32(header, 8, 3);
-    put32(header, 12, DAT_HEADER as u32);
-    put32(header, 16, ZERO_PACK_ID);
-    put32(header, 20, PACK_IO_PAGE_LAYOUT);
+    put32(&mut header, 8, 3);
+    put32(&mut header, 12, DAT_HEADER as u32);
+    put32(&mut header, 16, AUX_PACK_ID);
+    put32(&mut header, 20, PACK_IO_PAGE_LAYOUT);
     header[24..40].copy_from_slice(build_id);
-    put64(header, 40, PAGE);
-    put64(header, 48, BLOCK);
-    let checksum = crc32(&[header]);
-    put32(header, DAT_HEADER_CRC_AT, checksum);
-    volume
+    put64(&mut header, 40, PAGE);
+    put64(&mut header, 48, payload_len);
+    let checksum = crc32(&[&header]);
+    put32(&mut header, DAT_HEADER_CRC_AT, checksum);
+    header
 }
 
 /// AMPRPAK4 image: header, file/chunk/pack records and strings.
-fn build_manifest(rows: &[(String, &IndexFile)], mtime: i64, pkg_len: u64) -> Result<(Vec<u8>, bool)> {
+fn build_manifest(rows: &[(String, &IndexFile)], mtime: i64, pkg_len: u64,
+                  aux_size: u64, zero_at: Option<u64>) -> Result<Vec<u8>> {
     let vol_size = pkg_len.next_multiple_of(PAGE).max(2 * PAGE);
-    let has_sparse = rows.iter().any(|(_, file)| {
-        file.chunks.as_ref().is_some_and(|blocks| blocks.iter().any(|c| c.stored_len == 0))
-    });
     let mut strings = Vec::new();
     let mut add = |s: &str| {
         let at = strings.len() as u32;
@@ -301,7 +305,7 @@ fn build_manifest(rows: &[(String, &IndexFile)], mtime: i64, pkg_len: u64) -> Re
         put32(r, 32, at);
         put32(r, 36, len);
         let Some(blocks) = &f.chunks else { continue };
-        let p = plan(path, f.size, blocks, vol_size)?;
+        let p = plan(path, f.size, blocks, vol_size, aux_size, zero_at.unwrap_or(PAGE))?;
         put32(r, 24, (chunks.len() / CHUNK_RECORD) as u32);
         put32(r, 28, p.chunks.len() as u32);
         put32(r, 40, p.flags);
@@ -311,13 +315,14 @@ fn build_manifest(rows: &[(String, &IndexFile)], mtime: i64, pkg_len: u64) -> Re
             chunks.extend_from_slice(&desc.to_le_bytes());
         }
     }
-    let pack_count = 1 + usize::from(has_sparse);
+    let pack_count = 1 + usize::from(aux_size > PAGE);
     let mut pack = vec![0u8; pack_count * PACK_RECORD];
     let (at, len) = add(PKG_NAME);
     write_pack_record(&mut pack[..PACK_RECORD], vol_size - PAGE, at, len);
-    if has_sparse {
-        let (at, len) = add(ZERO_PACK_NAME);
-        write_pack_record(&mut pack[PACK_RECORD..], BLOCK, at, len);
+    if aux_size > PAGE {
+        let name = if zero_at == Some(PAGE) { ZERO_PACK_NAME } else { PATCH_PACK_NAME };
+        let (at, len) = add(name);
+        write_pack_record(&mut pack[PACK_RECORD..], aux_size - PAGE, at, len);
     }
 
     let mut m = vec![0u8; PAK_HEADER];
@@ -352,7 +357,7 @@ fn build_manifest(rows: &[(String, &IndexFile)], mtime: i64, pkg_len: u64) -> Re
     put32(&mut m, PAK_PAYLOAD_CRC_AT, payload);
     let header = crc32(&[&m[..PAK_HEADER_CRC_AT], &[0; 4], &m[PAK_HEADER_CRC_AT + 4..PAK_HEADER]]);
     put32(&mut m, PAK_HEADER_CRC_AT, header);
-    Ok((m, has_sparse))
+    Ok(m)
 }
 
 /// The AMPRIDX3 sort key: the folded path bytes (dump-forge's ampr_index.rs `key`).
@@ -375,10 +380,11 @@ pub struct IndexImages {
     pub index: Vec<u8>,
     pub manifest: Vec<u8>,
     pub zero_pack: Option<(&'static str, Vec<u8>)>,
+    pub patch_volume: Option<(Vec<u8>, u64)>,
 }
 
 /// Build the metadata for an unpublished cache.
-pub fn build(pkg_size: u64, mtime: i64, files: &[IndexFile]) -> Result<IndexImages> {
+pub fn build(pkg_size: u64, mtime: i64, files: &[IndexFile], patch_end: u64) -> Result<IndexImages> {
     if files.is_empty() {
         return Err(bad("no files to index".into()));
     }
@@ -395,8 +401,20 @@ pub fn build(pkg_size: u64, mtime: i64, files: &[IndexFile]) -> Result<IndexImag
     }
     let idx_rows: Vec<(String, u64)> = rows.iter().map(|r| (r.1.clone(), r.2.size)).collect();
     let pak_rows: Vec<(String, &IndexFile)> = rows.into_iter().map(|r| (r.1, r.2)).collect();
-    let (manifest, has_sparse) = build_manifest(&pak_rows, mtime, pkg_size)?;
+    let has_sparse = files.iter().any(|file| {
+        file.chunks.as_ref().is_some_and(|blocks| blocks.iter().any(|c| c.stored_len == 0))
+    });
+    let zero_at = has_sparse.then_some(patch_end);
+    let aux_size = patch_end + if has_sparse { BLOCK } else { 0 };
+    let manifest = build_manifest(&pak_rows, mtime, pkg_size, aux_size, zero_at)?;
     let index = build_index(&idx_rows, mtime);
-    let zero_pack = has_sparse.then(|| (ZERO_PACK_NAME, zero_volume(&manifest[24..40])));
-    Ok(IndexImages { index, manifest, zero_pack })
+    let header = (aux_size > PAGE).then(|| aux_header(&manifest[24..40], aux_size - PAGE));
+    let (zero_pack, patch_volume) = match header {
+        Some(mut header) if patch_end == PAGE => {
+            header.resize(aux_size as usize, 0);
+            (Some((ZERO_PACK_NAME, header)), None)
+        }
+        header => (None, header.map(|header| (header, aux_size))),
+    };
+    Ok(IndexImages { index, manifest, zero_pack, patch_volume })
 }

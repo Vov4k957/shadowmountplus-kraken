@@ -1281,6 +1281,16 @@
           packageReplace: "Replace",
           browse: "Browse",
           packageUpdate: "Update",
+          krakenApplyPatch: "Mount with this update",
+          krakenRestoreBase: "Mount the base game",
+          krakenApplyConfirm: "Apply this update to the mounted game?\n\n{path}",
+          krakenRestoreConfirm: "Switch to the base package? The update file will be kept.",
+          krakenPatchApplied: "Update applied",
+          krakenPatchInvalid: "Could not apply this LIH update. Check that it matches the original base PKG and see the debug log.",
+          krakenBaseMissing: "Mount the matching base PKG with U first.",
+          krakenCheckPatch: "Checking the update",
+          krakenCheckBase: "Checking the base PKG",
+          krakenBuildCache: "Preparing the game files",
           packageNoBase: "No base game",
           packageEnqueue: "Add to queue",
           packageQueued: "Queued",
@@ -1588,6 +1598,16 @@
           packageReplace: "Заменить",
           browse: "Обзор папок",
           packageUpdate: "Обновить",
+          krakenApplyPatch: "Смонтировать с этим обновлением",
+          krakenRestoreBase: "Смонтировать базовую версию",
+          krakenApplyConfirm: "Применить это обновление к смонтированной игре?\n\n{path}",
+          krakenRestoreConfirm: "Вернуться к базовому пакету? Файл обновления сохранится.",
+          krakenPatchApplied: "Обновление применено",
+          krakenPatchInvalid: "Не удалось применить LIH-патч. Проверьте, подходит ли он к исходному базовому PKG, и откройте журнал отладки.",
+          krakenBaseMissing: "Сначала смонтируйте подходящий базовый PKG кнопкой U.",
+          krakenCheckPatch: "Проверка обновления",
+          krakenCheckBase: "Проверка базового PKG",
+          krakenBuildCache: "Подготовка файлов игры",
           packageNoBase: "Нет игры",
           packageEnqueue: "В очередь",
           packageQueued: "В очереди",
@@ -3202,7 +3222,8 @@
         storage_busy: "busyStorage",
         storage_unavailable: "busyStorageUnavailable",
         pkg_invalid: "packageInvalid", pkg_base_missing: "packageBaseMissing", pkg_already_installed: "packageInstalled", pkg_queued: "packageQueued", pkg_queue_full: "packageQueueFull",
-        pkg_stream_lost: "packageStreamLost", pkg_source_changed: "sourceUnavailable"
+        pkg_stream_lost: "packageStreamLost", pkg_source_changed: "sourceUnavailable",
+        kraken_patch_invalid: "krakenPatchInvalid", kraken_base_missing: "krakenBaseMissing"
       };
 
       function operationErrorMessage(reason, fallback, details = {}) {
@@ -3430,6 +3451,8 @@
       }
 
       function storageJobStateLabel(job) {
+        if (job.operation === "mount_package" && job.state === "transferring")
+          return t(["krakenCheckPatch", "krakenCheckBase", "krakenBuildCache"][job.kraken_phase] || "krakenBuildCache");
         const labels = {
           installing: t("jobInstalling"),
           idle: t("jobIdle"),
@@ -3446,6 +3469,7 @@
       }
 
       function storageOperationLabel(operation, sourceType) {
+        if (operation === "mount_package") return t("packageMount");
         if (sourceType === "backport" && operation !== "delete") return t("operationInstall");
         if (operation === "eject") return t("ejectStorage");
         if (operation === "install") return t("operationInstall");
@@ -5005,9 +5029,9 @@
             Boolean(state.storageJob?.active && state.storageJob.source === entry.path);
           const install = row.querySelector(".package-install"), add = row.querySelector(".package-enqueue");
           install.textContent = t(installed ? "packageInstalled" : missing ? "packageNoBase" : entry.kind === "base" && entry.base_installed ? "packageReplace" : entry.kind === "patch" ? "packageUpdate" : "packageInstall");
-          install.disabled = !entry.installable || installed || missing || queued || state.browserBatchRunning || state.packageQueueLoading || Boolean(state.storageJob?.active);
+          install.disabled = entry.mount_patch || !entry.installable || installed || missing || queued || state.browserBatchRunning || state.packageQueueLoading || Boolean(state.storageJob?.active);
           add.textContent = t(queued ? "packageQueued" : "packageEnqueue");
-          add.disabled = !entry.installable || installed || queued || (missing && !baseQueued && !(!state.packageQueue && entry.base_queued)) || queue.length >= 32 || state.packageQueueLoading || state.browserBatchRunning ||
+          add.disabled = entry.mount_patch || !entry.installable || installed || queued || (missing && !baseQueued && !(!state.packageQueue && entry.base_queued)) || queue.length >= 32 || state.packageQueueLoading || state.browserBatchRunning ||
             Boolean(state.storageJob?.active && state.storageJob.operation === "delete" && !state.storageJob.title_id);
           const mount = row.querySelector(".package-mount");
           if (mount) mount.disabled = installed || queued || state.browserBatchRunning || Boolean(state.storageJob?.active);
@@ -5308,6 +5332,7 @@
             ? `${packageKind(entry.kind)} · ${entry.title_id} · ${entry.version || "—"} · SDK ${packageSdkVersion(entry.sdk_version)} · ${formatBytes(entry.size_bytes)}`
             : `${t("packageInvalid")} · ${formatBytes(entry.size_bytes)}`;
           info.append(node("p", "subtle", metadata), node("p", "subtle", entry.name));
+          if (entry.kraken_patch_applied) info.append(node("p", "subtle", t("krakenPatchApplied")));
           const install = actionButton(t("packageInstall"), () => installPackage(entry), "primary package-install");
           install.disabled = !entry.installable || Boolean(state.storageJob?.active);
           install.dataset.installable = String(Boolean(entry.installable));
@@ -5318,7 +5343,10 @@
           actions.append(install, add);
           if (entry.mountable) {
             const mount = actionButton("U", () => mountPackage(entry), "package-mount");
-            mount.setAttribute("aria-label", t("packageMount"));
+            const mountLabel = t(entry.mount_patch ? "krakenApplyPatch" :
+              entry.kraken_restore_base ? "krakenRestoreBase" : "packageMount");
+            mount.setAttribute("aria-label", mountLabel);
+            mount.title = mountLabel;
             actions.append(mount);
           }
           appendSourceDelete(actions, entry);
@@ -5375,8 +5403,17 @@
       }
 
       async function mountPackage(entry) {
+        const confirmation = entry.mount_patch ? "krakenApplyConfirm" :
+          entry.kraken_restore_base ? "krakenRestoreConfirm" : null;
+        if (confirmation && !await confirmAction(t(confirmation, { path: entry.path }))) return;
         try {
-          await api("/packages/mount", { path: entry.path });
+          const response = await api("/packages/mount", { path: entry.path });
+          if (response.job_id) {
+            renderStorageJob(response);
+            scheduleStorageJobPoll();
+            focusControl($("cancelTransfer"));
+            return;
+          }
           logActivity(t("packageMountQueued"));
           toast(t("packageMountQueued"));
           setTimeout(refreshAll, 1600);
