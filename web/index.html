@@ -5316,8 +5316,11 @@
           add.dataset.path = entry.path;
           const actions = node("div", "package-actions");
           actions.append(install, add);
-          if (entry.mountable)
-            actions.append(actionButton(t("packageMount"), () => mountPackage(entry), "package-mount"));
+          if (entry.mountable) {
+            const mount = actionButton("U", () => mountPackage(entry), "package-mount");
+            mount.setAttribute("aria-label", t("packageMount"));
+            actions.append(mount);
+          }
           appendSourceDelete(actions, entry);
           row.append(cover, info, actions);
           list.append(row);

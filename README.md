@@ -82,7 +82,7 @@ http://<PS5_IP>:10101
 | `.ffpfs` | PFS disk image | Supported |
 | `.ffpfsc` | Compressed PFS container holding another supported image | Supported; compression can affect loading performance |
 | Game folder | Extracted game files | Supported in scanned or manually specified paths |
-| `.pkg` | Plaintext PS5 debug base-game package | Use **Installation → Mount .pkg** for a compatible local package |
+| `.pkg` | Plaintext PS5 debug base-game package | Use **Installation → U** for a compatible local package |
 
 **Choose `.ffpkg` for general use.** Use `.exfat` when a game needs external-drive compatibility; create it with a **64 KB allocation unit**. Compressed `.ffpfsc` containers are best reserved for games without demanding continuous data streaming.
 
@@ -182,7 +182,7 @@ Open **Installation** to browse available PS5 storage, USB/external drives, and 
 
 - **Install from a folder or image:** select a supported PS4/PS5 game folder or `.ffpkg`, `.exfat`, `.ffpfs`, or `.ffpfsc` image, choose a local console destination, and start the installation. ShadowMountPlus copies the source and registers the copied game; the original source is retained.
 - **Install PKG files:** install base games, game updates (patches), or DLC packages from console storage, external drives, or an SMB share. The required base game must be present or included in the installation workflow.
-- **Mount a debug PS5 package:** select **Mount .pkg** next to a compatible plaintext debug base-game package on local console storage, M.2, or USB storage. SMP registers the game in the PS5 menu and reads game assets from that file. Keep the original `.pkg` in place while the game is registered. SMP stores launch files and the asset index under `/data/shadowmount/kraken/<TitleID>`. This experimental feature uses Kraken Mount's reader and its bundled AMPR-emu-ng runtime inside `shadowmountplus.elf`. Mounting an additional source for a registered Title ID requires first removing the previous registration. Only the base package is supported in this mode.
+- **Mount a debug PS5 package:** select **U** next to a compatible plaintext debug base-game package on local console storage, M.2, or USB storage. SMP registers the game in the PS5 menu and reads game assets from that file. Keep the original `.pkg` in place while the game is registered. SMP stores launch files and the asset index under `/data/shadowmount/kraken/<TitleID>`. This experimental feature uses Kraken Mount's reader and its bundled AMPR-emu-ng runtime inside `shadowmountplus.elf`. Mounting an additional source for a registered Title ID requires first removing the previous registration. Only the base package is supported in this mode.
 - **Remove a mounted package from the library:** use **Uninstall** from the SMP library to remove the registration. The source `.pkg` and cache remain available for mounting again.
 - **Install directly from a PC browser:** select PKG files on your computer and send them to the PS5 installer without first manually copying the complete packages to console storage. **Keep the browser page open until streaming completes.**
 - **Use the installation queue:** collect up to 32 PKGs from supported sources and follow installation progress. PC batches can be ordered automatically as **base game → update → DLC**, so dependent content is installed in the correct sequence. Queued files are not removed from their source storage merely because they have been installed.
