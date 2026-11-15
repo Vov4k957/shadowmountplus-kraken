@@ -69,6 +69,8 @@ type Read = unsafe extern "C" fn(*mut c_void, u64, *mut u8, usize) -> isize;
 type Write = unsafe extern "C" fn(*mut c_void, *const u8, usize, u64, *const u8, usize) -> i32;
 type LooseSize = unsafe extern "C" fn(*mut c_void, *const u8, usize, *mut u64) -> i32;
 type Progress = unsafe extern "C" fn(*mut c_void, u32, u64, u64);
+type LoadVerification = unsafe extern "C" fn(*mut c_void, *mut u8, usize) -> bool;
+type SaveVerification = unsafe extern "C" fn(*mut c_void, *const u8, usize);
 
 #[derive(Debug)]
 enum BuildError {
@@ -206,11 +208,13 @@ fn prepare(io: &PackageIo, size: u64, mtime: i64, basename: &str) -> Result<(), 
 }
 
 fn prepare_patched(io: &PackageIo, patch: &impl PRead, size: u64, patch_size: u64, mtime: i64,
-                   basename: &str, progress: impl Fn(u32, u64, u64),
+                   basename: &str, verification: &lih::Verification<'_>, progress: impl Fn(u32, u64, u64),
                    cancelled: impl Fn() -> bool) -> Result<(), BuildError> {
-    let view = lih::View::open(io, size, patch, patch_size, &cancelled,
+    let view = lih::View::open(io, size, patch, patch_size, verification, &cancelled,
                                |done, total| progress(0, done, total))?;
-    view.verify_base(|done, total| progress(1, done, total))?;
+    if !verification.fast {
+        view.verify_base(|done, total| progress(1, done, total))?;
+    }
     let pkg = Pkg::open_updated_image(&view, view.len(), |done, total| progress(3, done, total))?;
     prepare_package(io, &view, &pkg, size, mtime, basename,
                     |done, total| progress(2, done, total), |pkg, entry, cache, buffer| {
@@ -261,7 +265,9 @@ fn prepare_patched(io: &PackageIo, patch: &impl PRead, size: u64, patch_size: u6
             }
         }
         Ok(chunks)
-    })
+    })?;
+    view.save_verification(verification);
+    Ok(())
 }
 
 fn prepare_package(
@@ -366,12 +372,18 @@ pub unsafe extern "C" fn sm_kraken_build_patched_index(
     context: *mut c_void, size: u64, patch_size: u64, mtime: i64, basename: *const u8,
     basename_len: usize, read: Read, read_patch: Read, write: Write, loose_size: LooseSize,
     progress: Progress, is_cancelled: unsafe extern "C" fn(*mut c_void) -> i32,
+    fast: bool, load_verified: LoadVerification, save_verified: SaveVerification,
     error: *mut u8, error_len: usize,
 ) -> i32 {
     let io = PackageIo { context, read, write, loose_size };
     let patch = CallbackReader { context, read: read_patch };
+    let verification = lih::Verification {
+        fast,
+        load: Some(&|data| unsafe { load_verified(context, data.as_mut_ptr(), data.len()) }),
+        save: Some(&|data| unsafe { save_verified(context, data.as_ptr(), data.len()) }),
+    };
     let result = package_basename(unsafe { slice::from_raw_parts(basename, basename_len) })
-        .and_then(|name| prepare_patched(&io, &patch, size, patch_size, mtime, name,
+        .and_then(|name| prepare_patched(&io, &patch, size, patch_size, mtime, name, &verification,
             |phase, done, total| unsafe { progress(context, phase, done, total) },
             || unsafe { is_cancelled(context) != 0 }));
     unsafe { report_result(result, error, error_len) }

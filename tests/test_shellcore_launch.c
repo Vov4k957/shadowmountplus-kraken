@@ -1,4 +1,5 @@
 #include "host_platform.h"
+#include "sm_kraken.h"
 #include "sm_limits.h"
 #include "launch_types.inc"
 
@@ -28,10 +29,10 @@ static bool read_mount_link(const char *title, char *path, size_t size) {
 static bool is_under_image_mount_base(const char *path) {
   (void)path; return false;
 }
-static bool sm_kraken_is_cache(const char *path) {
+bool sm_kraken_is_cache(const char *path) {
   (void)path; return kraken_title;
 }
-static bool sm_kraken_source_ready(const char *path) {
+bool sm_kraken_source_ready(const char *path) {
   (void)path;
   if (package_missing) {
     errno = ENOENT;
@@ -76,6 +77,13 @@ static bool preserve_game_written_files(const char *cache, const char *staging) 
   (void)staging;
   assert(false); // This test publishes a new cache or defers an active title.
   return false;
+}
+
+static const char sm_kraken_revision[] = "test-revision";
+
+static int open_source(const sm_pkg_info_t *info, pkg_kind_t kind) {
+  assert(kind == PKG_KIND_BASE);
+  return open(info->path, O_RDONLY | O_NOFOLLOW);
 }
 
 #include "kraken_publish.inc"
@@ -147,9 +155,78 @@ static void test_kraken_publication(const char *directory) {
   puts("Kraken cache: scanner-owned publication and active-title protection passed");
 }
 
+static void snapshot_source(sm_pkg_info_t *info, const char *path) {
+  struct stat st;
+  assert(lstat(path, &st) == 0);
+  strlcpy(info->path, path, sizeof(info->path));
+  info->source_device = st.st_dev;
+  info->source_inode = st.st_ino;
+  info->source_size = st.st_size;
+  info->source_mtime = st.st_mtime;
+  info->source_ctime = st.st_ctime;
+  info->source_mtime_ns = st.st_mtim.tv_nsec;
+  info->source_ctime_ns = st.st_ctim.tv_nsec;
+}
+
+static void assert_file_contents(const char *path, const char *expected) {
+  char buffer[MAX_PATH + 600];
+  FILE *file = fopen(path, "rb");
+  assert(file != NULL);
+  size_t count = fread(buffer, 1, sizeof(buffer), file);
+  assert(!ferror(file) && count == strlen(expected));
+  assert(memcmp(buffer, expected, count) == 0);
+  assert(fclose(file) == 0);
+}
+
+static bool finalize_rebind(void *context) {
+  (void)context;
+  return true;
+}
+
+static void test_kraken_rebind(const char *directory) {
+  reset_state();
+  char cache[MAX_PATH], original[MAX_PATH], moved[MAX_PATH], image[MAX_PATH], marker[MAX_PATH];
+  assert(join_path(directory, TITLE_A, cache) && mkdir(cache, 0700) == 0);
+  assert(join_path(directory, "original.pkg", original) && join_path(directory, "moved.pkg", moved));
+  assert(join_path(cache, "kraken.image", image) && join_path(cache, KRAKEN_MARKER, marker));
+  FILE *file = fopen(original, "wb");
+  assert(file && fputs("base package bytes", file) >= 0 && fclose(file) == 0);
+  sm_pkg_info_t base = {.title_id = TITLE_A};
+  snapshot_source(&base, original);
+  char signature[280], updated[280];
+  assert(write_source_signature(&base, KRAKEN_REVISION, 314, signature));
+  assert(rename(original, moved) == 0);
+  snapshot_source(&base, moved);
+  uint64_t backport = 0;
+  assert(same_package_after_rename(&base, signature, &backport) && backport == 314);
+  base.source_inode++;
+  assert(!same_package_after_rename(&base, signature, &backport));
+  base.source_inode--;
+  assert(write_source_signature(&base, KRAKEN_REVISION, backport, updated));
+  patch_record_t patch = {.path = "/data/update.pkg", .signature = "stored-patch-signature\n"};
+  sm_kraken_job_t job = {.finalize = finalize_rebind};
+  assert(write_image_pointer(cache, "original.pkg"));
+
+  assert(mkdir(marker, 0700) == 0);
+  assert(!rebind_cache(&base, &job, cache, original, updated, &patch));
+  assert_file_contents(image, "kraken/original.pkg");
+  assert(rmdir(marker) == 0);
+
+  assert(rebind_cache(&base, &job, cache, original, updated, &patch));
+  char expected[MAX_PATH + 600];
+  int count = snprintf(expected, sizeof(expected), "%s\n%s%s\n%s", moved, updated,
+                      patch.path, patch.signature);
+  assert(count > 0 && (size_t)count < sizeof(expected));
+  assert_file_contents(marker, expected);
+  assert_file_contents(image, "kraken/moved.pkg");
+  assert_file_contents(moved, "base package bytes");
+  puts("Kraken relink: source identity, patch record and image pointer rollback passed");
+}
+
 int main(int argc, char **argv) {
   assert(argc == 2);
   test_kraken_publication(argv[1]);
+  test_kraken_rebind(argv[1]);
   reset_state();
   kraken_title = package_missing = true;
   assert(mount_managed_title_runtime(TITLE_A, true, false, NULL) == ENOENT);

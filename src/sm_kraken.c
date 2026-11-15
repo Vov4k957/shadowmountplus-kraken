@@ -19,6 +19,7 @@
 #define KRAKEN_MANIFEST ".smp-kraken-built"
 #define KRAKEN_REVISION "2"
 #define KRAKEN_PATCH_REVISION "5"
+#define KRAKEN_PATCH_FAST_REVISION "5-fast"
 #define KRAKEN_PATCH_VOLUME ".smp-kraken-patch.pak"
 
 extern const unsigned char sm_kraken_runtime_start[];
@@ -31,6 +32,8 @@ typedef int (*package_write_fn)(void *, const unsigned char *, size_t, uint64_t,
 typedef int (*package_loose_fn)(void *, const unsigned char *, size_t, uint64_t *);
 typedef void (*package_progress_fn)(void *, uint32_t, uint64_t, uint64_t);
 typedef int (*package_cancelled_fn)(void *);
+typedef bool (*package_load_verified_fn)(void *, unsigned char *, size_t);
+typedef void (*package_save_verified_fn)(void *, const unsigned char *, size_t);
 
 extern int sm_kraken_build_index(
     void *ctx, uint64_t size, int64_t mtime, const unsigned char *basename,
@@ -41,6 +44,7 @@ extern int sm_kraken_build_patched_index(
     const unsigned char *basename, size_t basename_len, package_read_fn read,
     package_read_fn read_patch, package_write_fn write, package_loose_fn loose,
     package_progress_fn progress, package_cancelled_fn is_cancelled,
+    bool fast, package_load_verified_fn load_verified, package_save_verified_fn save_verified,
     unsigned char *error, size_t error_len);
 
 typedef struct {
@@ -57,6 +61,7 @@ typedef struct {
   char output_path[MAX_PATH];
   const char *staging;
   const sm_kraken_job_t *job;
+  const sm_pkg_info_t *base;
 } cache_io_t;
 
 static bool join_path(const char *root, const char *name, char out[MAX_PATH]) {
@@ -630,6 +635,32 @@ static bool stage_backport_libraries(const char *backport, cache_io_t *io) {
   return error == 0;
 }
 
+static int package_signature_prefix(const sm_pkg_info_t *info, const char *revision,
+                                     char *out, size_t size) {
+  return snprintf(out, size, "%s %s %llx %llx %llx %llx %lx ",
+                         revision, sm_kraken_revision,
+                         (unsigned long long)info->source_device, (unsigned long long)info->source_inode,
+                         (unsigned long long)info->source_size, (unsigned long long)info->source_mtime,
+                         (unsigned long)info->source_mtime_ns);
+}
+
+static bool write_source_signature(const sm_pkg_info_t *info, const char *revision,
+                                    uint64_t signature, char out[280]) {
+  int prefix = package_signature_prefix(info, revision, out, 280);
+  if (prefix < 0 || prefix >= 280) {
+    errno = EOVERFLOW;
+    return false;
+  }
+  int written = snprintf(out + prefix, 280 - prefix, "%llx %lx %llx\n",
+                         (unsigned long long)info->source_ctime,
+                         (unsigned long)info->source_ctime_ns, (unsigned long long)signature);
+  if (written <= 0 || written >= 280 - prefix) {
+    errno = EOVERFLOW;
+    return false;
+  }
+  return true;
+}
+
 static bool source_signature(const sm_pkg_info_t *info, const char *backport,
                              const char *revision, char out[280]) {
   uint64_t signature = 0;
@@ -640,23 +671,96 @@ static bool source_signature(const sm_pkg_info_t *info, const char *backport,
     if (!walk_tree(path, strlen(path), fingerprint_backport_file, &signature))
       return false;
   }
-  int written = snprintf(out, 280, "%s %s %llx %llx %llx %llx %lx %llx %lx %llx\n",
-                         revision, sm_kraken_revision,
-                         (unsigned long long)info->source_device, (unsigned long long)info->source_inode,
-                         (unsigned long long)info->source_size, (unsigned long long)info->source_mtime,
-                         (unsigned long)info->source_mtime_ns, (unsigned long long)info->source_ctime,
-                         (unsigned long)info->source_ctime_ns, (unsigned long long)signature);
-  if (written <= 0 || written >= 280) {
-    errno = EOVERFLOW;
-    return false;
-  }
-  return true;
+  return write_source_signature(info, revision, signature, out);
 }
 
 static bool package_unchanged(const sm_pkg_info_t *info, int fd) {
   struct stat original, current;
   return fstat(fd, &original) == 0 && lstat(info->path, &current) == 0 &&
          sm_pkg_source_matches(info, &original) && sm_pkg_source_matches(info, &current);
+}
+
+static FILE *open_cache_temp(const char *target, char temporary[MAX_PATH]) {
+  int len = snprintf(temporary, MAX_PATH, "%s.XXXXXX", target);
+  if (len < 0 || len >= MAX_PATH) {
+    errno = ENAMETOOLONG;
+    return NULL;
+  }
+  int fd = mkstemp(temporary);
+  if (fd < 0)
+    return NULL;
+  FILE *file = fdopen(fd, "wb");
+  if (!file) {
+    int error = errno;
+    close(fd);
+    unlink(temporary);
+    errno = error;
+  }
+  return file;
+}
+
+static bool finish_cache_temp(FILE *file, const char *temporary, const char *target, bool written) {
+  int error = written ? 0 : (errno ? errno : EIO);
+  if (error == 0 && (fflush(file) != 0 || fsync(fileno(file)) != 0))
+    error = errno;
+  if (fclose(file) != 0 && error == 0)
+    error = errno;
+  if (error == 0 && rename(temporary, target) != 0)
+    error = errno;
+  if (error)
+    unlink(temporary);
+  errno = error;
+  return error == 0;
+}
+
+static bool verification_path(const cache_io_t *io, char path[MAX_PATH], char signature[280]) {
+  char name[40];
+  snprintf(name, sizeof(name), ".verified-%s", io->base->title_id);
+  return join_path(KRAKEN_CACHE, name, path) &&
+      write_source_signature(io->base, "verified-1", 0, signature);
+}
+
+static bool load_verified(void *context, unsigned char *bytes, size_t size) {
+  const cache_io_t *io = context;
+  char path[MAX_PATH], signature[280], saved[280];
+  if (!verification_path(io, path, signature))
+    return false;
+  int fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+  if (fd < 0)
+    return false;
+  FILE *file = fdopen(fd, "rb");
+  if (!file) {
+    close(fd);
+    return false;
+  }
+  bool valid = fgets(saved, sizeof(saved), file) && strcmp(saved, signature) == 0 &&
+      fread(bytes, 1, size, file) == size && fgetc(file) == EOF && !ferror(file);
+  fclose(file);
+  return valid;
+}
+
+static void save_verified(void *context, const unsigned char *bytes, size_t size) {
+  const cache_io_t *io = context;
+  if (cache_cancelled(io) || !package_unchanged(io->base, io->package_fd))
+    return;
+  char path[MAX_PATH], signature[280], temporary[MAX_PATH];
+  if (!verification_path(io, path, signature))
+    return;
+  FILE *file = open_cache_temp(path, temporary);
+  if (file)
+    (void)finish_cache_temp(file, temporary, path,
+        fputs(signature, file) >= 0 && fwrite(bytes, 1, size, file) == size);
+}
+
+static bool write_cache_marker(const char *cache, const char *source, const char *signature,
+                                const patch_record_t *patch) {
+  char path[MAX_PATH], temporary[MAX_PATH];
+  FILE *file = join_path(cache, KRAKEN_MARKER, path) ? open_cache_temp(path, temporary) : NULL;
+  if (!file)
+    return false;
+  bool written = fprintf(file, "%s\n%s", source, signature) >= 0 &&
+      (!patch || fprintf(file, "%s\n%s", patch->path, patch->signature) >= 0);
+  return finish_cache_temp(file, temporary, path, written);
 }
 
 static void remove_staging(const char *path) {
@@ -703,6 +807,7 @@ static bool prepare_cache(const sm_pkg_info_t *info, const sm_pkg_info_t *patch,
   if (!join_path(KRAKEN_CACHE, info->title_id, cache) || !sm_kraken_is_cache(cache))
     return false;
   char existing[MAX_PATH] = "", current[280], saved[280] = "", patch_signature[280] = "";
+  const char *patch_revision = job->fast ? KRAKEN_PATCH_FAST_REVISION : KRAKEN_PATCH_REVISION;
   patch_record_t old_patch = {0};
   char backport[MAX_PATH] = "", package_dir[MAX_PATH], backup[MAX_PATH];
   strlcpy(package_dir, info->path, sizeof(package_dir));
@@ -712,15 +817,19 @@ static bool prepare_cache(const sm_pkg_info_t *info, const sm_pkg_info_t *patch,
   *separator = '\0';
   (void)resolve_backport_path_for_title(info->title_id, package_dir, backport);
   if (!source_signature(info, backport, KRAKEN_REVISION, current) ||
-      (patch && !source_signature(patch, "", KRAKEN_PATCH_REVISION, patch_signature)))
+      (patch && !source_signature(patch, "", patch_revision, patch_signature)))
     return false;
 
   if (read_cache_marker(cache, existing, saved, sizeof(saved), &old_patch) &&
       strcmp(existing, info->path) == 0) {
     bool intact = sm_kraken_source_ready(cache) && directory_has_game_executable(cache);
-    bool same_patch = patch ? strcmp(old_patch.path, patch->path) == 0 &&
-                                  strcmp(old_patch.signature, patch_signature) == 0
-                            : !old_patch.path[0];
+    bool same_patch = !patch && !old_patch.path[0];
+    if (patch && strcmp(old_patch.path, patch->path) == 0) {
+      char full_signature[280];
+      same_patch = strcmp(old_patch.signature, patch_signature) == 0 ||
+          (job->fast && source_signature(patch, "", KRAKEN_PATCH_REVISION, full_signature) &&
+           strcmp(old_patch.signature, full_signature) == 0);
+    }
     if (intact && same_patch && strcmp(current, saved) == 0) {
       if (job->finalize(job->ctx))
         return true;
@@ -764,7 +873,7 @@ static bool prepare_cache(const sm_pkg_info_t *info, const sm_pkg_info_t *patch,
     return false;
   }
   cache_io_t io = {.package_fd = fd, .patch_fd = patch_fd, .patch_output_fd = -1,
-                   .output_fd = -1, .staging = staging, .job = job};
+                   .output_fd = -1, .staging = staging, .job = job, .base = info};
   char package_mount[MAX_PATH];
   char build_error[MAX_PATH + 256] = "";
   const char *name = strrchr(info->path, '/') + 1;
@@ -778,7 +887,8 @@ static bool prepare_cache(const sm_pkg_info_t *info, const sm_pkg_info_t *patch,
     int result = patch ? sm_kraken_build_patched_index(
         &io, info->source_size, patch->source_size, (int64_t)patch->source_mtime,
         basename, strlen(name), package_read, patch_read, stage_write,
-        staged_file_size, patch_progress, patch_cancelled, message, sizeof(build_error))
+        staged_file_size, patch_progress, patch_cancelled, job->fast, load_verified,
+        save_verified, message, sizeof(build_error))
         : sm_kraken_build_index(&io, info->source_size, (int64_t)info->source_mtime,
         basename, strlen(name), package_read, stage_write, staged_file_size,
         message, sizeof(build_error));
@@ -819,20 +929,13 @@ static bool prepare_cache(const sm_pkg_info_t *info, const sm_pkg_info_t *patch,
   }
   if (error == 0 && !write_build_manifest(staging))
     error = errno ? errno : EIO;
-  if (error == 0) {
-    char marker_path[MAX_PATH];
-    FILE *marker = join_path(staging, KRAKEN_MARKER, marker_path)
-                       ? fopen(marker_path, "wx") : NULL;
-    if (!marker) {
-      error = errno ? errno : EIO;
-    } else {
-      if (fprintf(marker, "%s\n%s", info->path, current) < 0 ||
-          (patch && fprintf(marker, "%s\n%s", patch->path, patch_signature) < 0))
-        error = errno ? errno : EIO;
-      if (fclose(marker) != 0 && error == 0)
-        error = errno;
-    }
+  patch_record_t applied = {0};
+  if (patch) {
+    strlcpy(applied.path, patch->path, sizeof(applied.path));
+    strlcpy(applied.signature, patch_signature, sizeof(applied.signature));
   }
+  if (error == 0 && !write_cache_marker(staging, info->path, current, patch ? &applied : NULL))
+    error = errno ? errno : EIO;
   if (error == 0 && !job->finalize(job->ctx))
     error = ECANCELED;
   if (error == 0 && !publish_cache(info->title_id, staging, cache, backup))
@@ -868,4 +971,120 @@ bool sm_kraken_apply_patch(const sm_pkg_info_t *base, const sm_pkg_info_t *patch
   }
   char cache[MAX_PATH];
   return prepare_cache(base, patch, job, cache);
+}
+
+static bool relink_candidate(const char *cache, const char *existing, const sm_pkg_info_t *base) {
+  struct stat st;
+  if (strcmp(existing, base->path) == 0) {
+    if (sm_kraken_source_ready(cache))
+      return false;
+  } else if (lstat(existing, &st) == 0 || (errno != ENOENT && errno != ENOTDIR)) {
+    return false;
+  }
+  sm_pkg_info_t metadata;
+  return base->pkg_kind == PKG_KIND_BASE && base->content_id[0] &&
+      strcmp(strrchr(cache, '/') + 1, base->title_id) == 0 &&
+      sm_pkg_read_directory_metadata(cache, &metadata) &&
+      strcmp(base->content_id, metadata.content_id) == 0;
+}
+
+bool sm_kraken_can_relink(const char *cache, const sm_pkg_info_t *base) {
+  char existing[MAX_PATH];
+  return sm_kraken_source(cache, existing) && relink_candidate(cache, existing, base);
+}
+
+static bool same_package_after_rename(const sm_pkg_info_t *base, const char *saved,
+                                      uint64_t *backport) {
+  char prefix[280];
+  int length = package_signature_prefix(base, KRAKEN_REVISION, prefix, sizeof(prefix));
+  if (base->source_inode == 0 || length <= 0 || (size_t)length >= sizeof(prefix) ||
+      strncmp(saved, prefix, (size_t)length) != 0)
+    return false;
+  unsigned long long ctime, fingerprint;
+  unsigned long ctime_ns;
+  int parsed = 0;
+  if (sscanf(saved + length, "%llx %lx %llx%n", &ctime, &ctime_ns, &fingerprint, &parsed) != 3 ||
+      strcmp(saved + length + parsed, "\n") != 0)
+    return false;
+  *backport = fingerprint;
+  return true;
+}
+
+static bool write_image_pointer(const char *cache, const char *name) {
+  char path[MAX_PATH], temporary[MAX_PATH];
+  FILE *file = join_path(cache, "kraken.image", path) ? open_cache_temp(path, temporary) : NULL;
+  if (!file)
+    return false;
+  // The pointer is read by the game's runtime.
+  bool written = fchmod(fileno(file), 0644) == 0 &&
+      fprintf(file, SM_KRAKEN_PACKAGE_DIR "/%s", name) >= 0;
+  return finish_cache_temp(file, temporary, path, written);
+}
+
+static bool rebind_cache(const sm_pkg_info_t *base, const sm_kraken_job_t *job,
+                          const char *cache, const char *existing,
+                          const char *signature, const patch_record_t *patch) {
+  int fd = open_source(base, PKG_KIND_BASE);
+  if (fd < 0)
+    return false;
+  int error = 0;
+  const char *name = strrchr(base->path, '/') + 1;
+  const char *old_name = strrchr(existing, '/') + 1;
+  bool renamed = strcmp(name, old_name) != 0;
+  if (cancelled(NULL) || !job->finalize(job->ctx))
+    error = ECANCELED;
+  else if (sm_shellcore_title_is_protected(base->title_id))
+    error = EBUSY;
+  runtime_mount_state_lock();
+  if (error == 0 && is_data_mounted(base->title_id) &&
+      !unmount_title_runtime_layers_quiet(base->title_id))
+    error = errno ? errno : EBUSY;
+  if (error == 0 && !package_unchanged(base, fd))
+    error = EAGAIN;
+  if (error == 0 && renamed && !write_image_pointer(cache, name))
+    error = errno ? errno : EIO;
+  else if (error == 0 && !write_cache_marker(cache, base->path, signature, patch)) {
+    error = errno ? errno : EIO;
+    if (renamed && !write_image_pointer(cache, old_name))
+      log_debug("  [KRAKEN] could not restore image pointer for %s", base->title_id);
+  }
+  runtime_mount_state_unlock();
+  close(fd);
+  errno = error;
+  return error == 0;
+}
+
+bool sm_kraken_relink_base(const sm_pkg_info_t *base, const sm_kraken_job_t *job,
+                           char cache[MAX_PATH], bool keep_patch) {
+  char existing[MAX_PATH], saved[280], updated[280], index[MAX_PATH];
+  patch_record_t old_patch = {0};
+  if (!read_cache_marker(cache, existing, saved, sizeof(saved), &old_patch) ||
+      !relink_candidate(cache, existing, base)) {
+    errno = EEXIST;
+    return false;
+  }
+  bool patched = old_patch.path[0] != '\0';
+  uint64_t backport;
+  if ((!patched || keep_patch) && same_package_after_rename(base, saved, &backport) &&
+      join_path(cache, "ampr_assets.index", index) && path_exists(index) &&
+      directory_has_game_executable(cache) &&
+      write_source_signature(base, KRAKEN_REVISION, backport, updated))
+    return rebind_cache(base, job, cache, existing, updated, patched ? &old_patch : NULL);
+
+  if (!keep_patch || !patched)
+    return sm_kraken_prepare_base(base, job, cache);
+
+  // Rebuild ranges from the replacement PKG before publishing a new binding.
+  // Apply only the exact recorded LIH when recovering an existing update.
+  sm_pkg_info_t patch;
+  char previous[280], fast[280];
+  if (!sm_pkg_parse_file(old_patch.path, NULL, &patch) ||
+      !sm_kraken_can_apply_patch(&patch) ||
+      !write_source_signature(&patch, KRAKEN_PATCH_REVISION, 0, previous) ||
+      !write_source_signature(&patch, KRAKEN_PATCH_FAST_REVISION, 0, fast) ||
+      (strcmp(old_patch.signature, previous) != 0 && strcmp(old_patch.signature, fast) != 0)) {
+    errno = ENOENT;
+    return false;
+  }
+  return sm_kraken_apply_patch(base, &patch, job);
 }

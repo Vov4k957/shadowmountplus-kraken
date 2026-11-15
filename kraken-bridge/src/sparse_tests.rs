@@ -5,7 +5,7 @@ use std::{ptr, slice, str};
 use kraken_mount_pkg::{Error, PRead};
 use sha3::{Digest, Sha3_256};
 
-use super::{prepare, prepare_patched, PackageIo, Pkg};
+use super::{lih::Verification, prepare, prepare_patched, PackageIo, Pkg};
 
 const PAGE: usize = 0x1_0000;
 const BLOCK: usize = 4 * PAGE;
@@ -369,7 +369,7 @@ fn lih_decodes_an_lz_file_up_to_its_inode_end() {
         let mut io = TestIo { pkg: base.clone(), files: BTreeMap::new() };
         let reader = PackageIo { context: ptr::from_mut(&mut io).cast(), read, write, loose_size };
         let result = prepare_patched(&reader, &patch, base.len() as u64, patch.0.len() as u64,
-                                     1, "base.pkg", |_, _, _| {}, || false);
+                                     1, "base.pkg", &Verification::default(), |_, _, _| {}, || false);
         if size == expected.len() && tag == 6 && encoded == stored {
             result.unwrap();
             let manifest = &io.files["ampr_assets.index"];
@@ -430,7 +430,7 @@ fn lih_resolves_an_interior_kraken_boundary_from_both_halves() {
         let mut io = TestIo { pkg: base.clone(), files: BTreeMap::new() };
         let reader = PackageIo { context: ptr::from_mut(&mut io).cast(), read, write, loose_size };
         let result = prepare_patched(&reader, &patch, base.len() as u64, patch.0.len() as u64,
-                                     1, "base.pkg", |_, _, _| {}, || false);
+                                     1, "base.pkg", &Verification::default(), |_, _, _| {}, || false);
         if size == right_size {
             result.unwrap();
             let manifest = &io.files["ampr_assets.index"];
@@ -507,7 +507,7 @@ fn lih_resolves_one_half_then_a_block_with_two_halves() {
         let mut io = TestIo { pkg: base.clone(), files: BTreeMap::new() };
         let reader = PackageIo { context: ptr::from_mut(&mut io).cast(), read, write, loose_size };
         let result = prepare_patched(&reader, &patch, base.len() as u64, patch.0.len() as u64,
-                                     1, "base.pkg", |_, _, _| {}, || false);
+                                     1, "base.pkg", &Verification::default(), |_, _, _| {}, || false);
         if first_size != layout_size {
             let error = result.unwrap_err();
             assert!(matches!(&error, super::BuildError::Decode(message) if message.contains("131056 bytes, expected 131072")), "{error:?}");
@@ -550,7 +550,7 @@ fn lih_indexes_chunks_by_file_offset() {
     let mut io = TestIo { pkg: base.clone(), files: BTreeMap::new() };
     let reader = PackageIo { context: ptr::from_mut(&mut io).cast(), read, write, loose_size };
     prepare_patched(&reader, &patch, base.len() as u64, patch.0.len() as u64,
-                    1, "base.pkg", |_, _, _| {}, || false).unwrap();
+                    1, "base.pkg", &Verification::default(), |_, _, _| {}, || false).unwrap();
     let manifest = &io.files["ampr_assets.index"];
     let chunks = get64(manifest, 80) as usize;
     let last_chunk = get64(manifest, chunks + 24);
@@ -569,9 +569,76 @@ fn lih_applies_across_title_ids_and_rejects_another_title() {
     let patch = make_patch(&base, &target);
     let base = TestRead(base);
     let result = super::lih::View::open(&base, base.0.len() as u64, &patch,
-                                       patch.0.len() as u64, || false, |_, _| {});
+                                       patch.0.len() as u64, &Verification::default(), || false, |_, _| {});
     assert!(matches!(result, Err(Error::Unsupported(message)) if message.contains("content ID")));
     check_lih(title, b"updated game asset");
+}
+
+#[test]
+fn lih_reuses_verified_pages_across_different_patches() {
+    use super::lih::View;
+    use std::cell::{Cell, RefCell};
+
+    let title = b"UP0001-PPSA54321_00-SYNTHETICPACKAGE";
+    let base = TestRead(with_digests(synthetic_pkg(BLOCK), title));
+    let saved = RefCell::new(Vec::new());
+    let save = |bytes: &[u8]| { saved.replace(bytes.to_vec()); };
+    let load = |bytes: &mut [u8]| {
+        let saved = saved.borrow();
+        if bytes.len() != saved.len() {
+            return false;
+        }
+        bytes.copy_from_slice(&saved);
+        true
+    };
+    let mode = Verification { fast: false, load: Some(&load), save: Some(&save) };
+    let total = Cell::new(0);
+    for (index, changed_page) in [3, 4, 4].into_iter().enumerate() {
+        let mut target = base.0.clone();
+        target[changed_page * PAGE + 500] ^= 1;
+        let patch = make_patch(&base.0, &with_digests(target, title));
+        let view = View::open(&base, base.0.len() as u64, &patch, patch.0.len() as u64,
+                              &mode, || false, |_, _| {}).unwrap();
+        view.verify_base(|_, bytes| total.set(bytes)).unwrap();
+        match index {
+            0 | 2 => assert!(total.get() > PAGE as u64),
+            1 => assert_eq!(total.get(), PAGE as u64),
+            _ => unreachable!(),
+        }
+        view.save_verification(&mode);
+        if index == 1 {
+            saved.borrow_mut()[32] ^= 1; // Damaged verification record.
+        }
+    }
+}
+
+#[test]
+fn fast_lih_hashes_pages_read_by_the_builder() {
+    let title = b"UP0001-PPSA54321_00-SYNTHETICPACKAGE";
+    let base = with_digests(synthetic_pkg_with_assets(BLOCK + PAGE, &vec![0x37; PAGE], None), title);
+    let mut target = base.clone();
+    target[5 * PAGE + 500] ^= 1;
+    let patch = make_patch(&base, &with_digests(target, title));
+    let mut io = TestIo { pkg: base, files: BTreeMap::new() };
+    let reader = PackageIo { context: ptr::from_mut(&mut io).cast(), read, write, loose_size };
+    let size = io.pkg.len() as u64;
+    let fast = Verification { fast: true, ..Verification::default() };
+    let build = |verification: &Verification<'_>| prepare_patched(
+        &reader, &patch, size, patch.0.len() as u64, 1, "base.pkg",
+        verification, |_, _, _| {}, || false);
+
+    io.pkg[IMAGE + 100] ^= 1; // An unchanged asset which is read only at runtime.
+    build(&fast).unwrap();
+    let manifest = &io.files["ampr_assets.index"];
+    let chunks = get64(manifest, 80) as usize;
+    assert_eq!(get64(manifest, chunks + 24), IMAGE as u64);
+    let error = build(&Verification::default()).unwrap_err();
+    assert!(matches!(error, super::BuildError::Other(message) if message.contains("fails its LIH digest")));
+
+    io.pkg[IMAGE + 100] ^= 1;
+    io.pkg[IMAGE + PAGE + 128] ^= 1; // Executable bytes read into the cache.
+    let error = build(&fast).unwrap_err();
+    assert!(matches!(error, super::BuildError::Other(message) if message.contains("fails its LIH digest")));
 }
 
 fn check_lih(content_id: &[u8; 36], asset: &[u8; 18]) {
@@ -584,12 +651,12 @@ fn check_lih(content_id: &[u8; 36], asset: &[u8; 18]) {
     let patch_size = patch.0.len() as u64;
     let mut io = TestIo { pkg: base, files: BTreeMap::new() };
     let reader = PackageIo { context: ptr::from_mut(&mut io).cast(), read, write, loose_size };
-    let view = super::lih::View::open(&reader, base_size, &patch, patch_size, || false, |_, _| {}).unwrap();
+    let view = super::lih::View::open(&reader, base_size, &patch, patch_size, &Verification::default(), || false, |_, _| {}).unwrap();
     let mut result = vec![0; target.len()];
     assert_eq!(view.pread(0, &mut result).unwrap(), target.len());
     assert_eq!(result, target);
     let phases = std::cell::Cell::new(0);
-    prepare_patched(&reader, &patch, base_size, patch_size, 1, "base.pkg", |phase, _, _| {
+    prepare_patched(&reader, &patch, base_size, patch_size, 1, "base.pkg", &Verification::default(), |phase, _, _| {
         phases.set(phases.get() | 1 << phase);
     }, || false).unwrap();
     assert_eq!(phases.get(), 0b1111);
@@ -614,12 +681,12 @@ fn check_lih(content_id: &[u8; 36], asset: &[u8; 18]) {
 
     io.pkg[3 * PAGE + 500] ^= 1;
     io.files.clear();
-    let err = prepare_patched(&reader, &patch, base_size, patch_size, 1, "base.pkg", |_, _, _| {}, || false)
+    let err = prepare_patched(&reader, &patch, base_size, patch_size, 1, "base.pkg", &Verification::default(), |_, _, _| {}, || false)
         .unwrap_err();
     assert!(matches!(&err, super::BuildError::Other(msg) if msg.contains("fails its LIH digest")), "{err:?}");
     assert!(io.files.is_empty());
     io.pkg = with_digests(io.pkg, content_id);
-    let err = prepare_patched(&reader, &patch, base_size, patch_size, 1, "base.pkg", |_, _, _| {}, || false)
+    let err = prepare_patched(&reader, &patch, base_size, patch_size, 1, "base.pkg", &Verification::default(), |_, _, _| {}, || false)
         .unwrap_err();
     assert!(matches!(&err, super::BuildError::Other(msg) if msg.contains("blocks absent")), "{err:?}");
     assert!(io.files.is_empty());

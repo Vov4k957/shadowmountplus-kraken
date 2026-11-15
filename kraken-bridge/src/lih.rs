@@ -3,7 +3,7 @@
 //! versions, so use the image digests even for the data supplied by the base.
 
 use alloc::{collections::BTreeMap, format, string::String, vec, vec::Vec};
-use core::ops::Range;
+use core::{cell::RefCell, ops::Range};
 use kraken_mount_pkg::{Error, PRead};
 use sha3::{Digest, Sha3_256};
 
@@ -136,9 +136,19 @@ pub enum Source {
     Patch,
 }
 
-struct Location {
-    offset: u64,
-    digest: BlockDigest,
+#[derive(Default)]
+pub struct Verification<'a> {
+    pub fast: bool,
+    pub load: Option<&'a dyn Fn(&mut [u8]) -> bool>,
+    pub save: Option<&'a dyn Fn(&[u8])>,
+}
+
+fn is_verified(bits: &[u8], page: usize) -> bool {
+    bits[page / 8] & (1 << (page % 8)) != 0
+}
+
+fn mark_verified(bits: &mut [u8], page: usize) {
+    bits[page / 8] |= 1 << (page % 8);
 }
 
 #[derive(Clone, Copy)]
@@ -155,14 +165,18 @@ pub struct View<'a, B, P> {
     header_at: u64,
     cnt: Range<u64>,
     // The top bit of a location's offset distinguishes patch from base.
-    blocks: Vec<Location>,
+    blocks: Vec<u64>,
+    base_start: u64,
+    base_digests: Vec<BlockDigest>,
+    verified: RefCell<Vec<u8>>,
 }
 
 const PATCH: u64 = 1 << 63;
 
 impl<'a, B: PRead, P: PRead> View<'a, B, P> {
     pub fn open(base: &'a B, base_len: u64, patch: &'a P, patch_len: u64,
-                cancelled: impl Fn() -> bool, progress: impl Fn(u64, u64)) -> Result<Self, Error> {
+                verification: &Verification<'_>, cancelled: impl Fn() -> bool,
+                progress: impl Fn(u64, u64)) -> Result<Self, Error> {
         let mut head = [0; 0x40];
         read_exact(patch, 0, &mut head)?;
         if &head[..4] != b"\x7fLIH" || head[6..8] != [1, 0] {
@@ -195,12 +209,6 @@ impl<'a, B: PRead, P: PRead> View<'a, B, P> {
         if original_cnt.content_id[0] == 0 || original_cnt.content_id != updated_cnt.content_id {
             return Err(unsupported("LIH content ID does not match the base package"));
         }
-        let mut marker = [0; 16];
-        read_exact(base, original.superblock + 0x370, &mut marker)?;
-        if &marker != b"PPRPLAIN-NOAUTH!" {
-            return Err(unsupported("LIH base image must be plaintext"));
-        }
-
         let wanted = updated_cnt.digests;
         let mut stored = BTreeMap::new();
         let mut batch = vec![0; 16 * PAGE as usize];
@@ -240,12 +248,28 @@ impl<'a, B: PRead, P: PRead> View<'a, B, P> {
                 };
                 original.pfs.start + u64::from(i) * PAGE
             };
-            blocks.push(Location { offset, digest: hash });
+            blocks.push(offset);
         }
         if used.len() != stored.len() {
             return Err(corrupt("some LIH blocks do not match its image digests"));
         }
-        let view = Self { base, patch, image, header_at: header.start, cnt, blocks };
+        let mut verified = vec![0; original.blocks().div_ceil(8)];
+        if let Some(load) = verification.load {
+            let mut saved = vec![0; 32 + verified.len()];
+            if load(&mut saved) && saved[..32] == digest(&saved[32..]) {
+                verified.copy_from_slice(&saved[32..]);
+            }
+        }
+        let view = Self {
+            base, patch, image, header_at: header.start, cnt, blocks,
+            base_start: original.pfs.start, base_digests: original_cnt.digests,
+            verified: RefCell::new(verified),
+        };
+        let mut marker = [0; 16];
+        view.read_base(original.superblock + 0x370, &mut marker)?;
+        if &marker != b"PPRPLAIN-NOAUTH!" {
+            return Err(unsupported("LIH base image must be plaintext"));
+        }
         read_exact(&view, view.image.superblock + 0x370, &mut marker)?;
         if &marker != b"PPRPLAIN-NOAUTH!" {
             return Err(unsupported("LIH target image must be plaintext"));
@@ -253,39 +277,95 @@ impl<'a, B: PRead, P: PRead> View<'a, B, P> {
         Ok(view)
     }
 
-    pub fn base_region(&self) -> (u64, u64) {
-        let mut offsets = self.blocks.iter().filter(|location| location.offset & PATCH == 0)
-            .map(|location| location.offset);
-        let Some(first) = offsets.next() else { return (0, 0) };
-        let (min, max) = offsets.fold((first, first), |(min, max), at| (min.min(at), max.max(at)));
-        (min, max + PAGE)
+    pub fn save_verification(&self, verification: &Verification<'_>) {
+        if let Some(save) = verification.save {
+            let bits = self.verified.borrow();
+            let mut record = Vec::with_capacity(32 + bits.len());
+            record.extend_from_slice(&digest(&bits));
+            record.extend_from_slice(&bits);
+            save(&record);
+        }
+    }
+
+    fn base_page(&self, offset: u64) -> usize {
+        ((offset - self.base_start) / PAGE) as usize
+    }
+
+    fn verify_page(&self, page: usize, bytes: &[u8], verified: &mut [u8]) -> Result<(), Error> {
+        if digest(bytes) != self.base_digests[page] {
+            let offset = self.base_start + page as u64 * PAGE;
+            return Err(corrupt(format!("base PKG block at {offset:#x} fails its LIH digest")));
+        }
+        mark_verified(verified, page);
+        Ok(())
     }
 
     /// Validate referenced base bytes in physical order, once per block.
     /// Source files are fingerprinted again just before publication.
     pub fn verify_base(&self, progress: impl Fn(u64, u64)) -> Result<(), Error> {
-        let (begin, end) = self.base_region();
-        if begin == end {
+        let mut verified = self.verified.borrow_mut();
+        let mut needed = vec![0; verified.len()];
+        for &offset in self.blocks.iter().filter(|&&offset| offset & PATCH == 0) {
+            mark_verified(&mut needed, self.base_page(offset));
+        }
+        for (needed, verified) in needed.iter_mut().zip(verified.iter()) {
+            *needed &= !verified;
+        }
+        let total = needed.iter().map(|byte| u64::from(byte.count_ones())).sum::<u64>() * PAGE;
+        progress(0, total);
+        if total == 0 {
             return Ok(());
         }
-        let mut expected = vec![None; ((end - begin) / PAGE) as usize];
-        for location in self.blocks.iter().filter(|location| location.offset & PATCH == 0) {
-            expected[((location.offset - begin) / PAGE) as usize] = Some(&location.digest);
-        }
         let mut batch = vec![0; 16 * PAGE as usize];
-        let mut at = begin;
-        for group in expected.chunks(16) {
-            if group.iter().any(Option::is_some) {
-                let bytes = &mut batch[..group.len() * PAGE as usize];
-                read_exact(self.base, at, bytes)?;
-                for (i, (block, want)) in bytes.chunks_exact(PAGE as usize).zip(group).enumerate() {
-                    if want.is_some_and(|want| digest(block) != *want) {
-                        return Err(corrupt(format!("base PKG block at {:#x} fails its LIH digest", at + i as u64 * PAGE)));
-                    }
-                }
+        let mut done = 0;
+        let mut page = 0;
+        while page < self.base_digests.len() {
+            if !is_verified(&needed, page) {
+                page += 1;
+                continue;
             }
-            at += group.len() as u64 * PAGE;
-            progress(at - begin, end - begin);
+            let end = (page + 1..(page + 16).min(self.base_digests.len()))
+                .find(|&next| !is_verified(&needed, next))
+                .unwrap_or((page + 16).min(self.base_digests.len()));
+            let bytes = &mut batch[..(end - page) * PAGE as usize];
+            read_exact(self.base, self.base_start + page as u64 * PAGE, bytes)?;
+            for (block, data) in (page..end).zip(bytes.chunks_exact(PAGE as usize)) {
+                self.verify_page(block, data, &mut verified)?;
+            }
+            done += bytes.len() as u64;
+            progress(done, total);
+            page = end;
+        }
+        Ok(())
+    }
+
+    // Fast mode validates whole pages before using any part in the built cache.
+    // Ranges emitted directly as index offsets are left for the runtime to read.
+    fn read_base(&self, mut offset: u64, mut out: &mut [u8]) -> Result<(), Error> {
+        if out.is_empty() {
+            return Ok(());
+        }
+        let mut verified = self.verified.borrow_mut();
+        let first = self.base_page(offset);
+        let last = self.base_page(offset + out.len() as u64 - 1);
+        if (first..=last).all(|page| is_verified(&verified, page)) {
+            return read_exact(self.base, offset, out);
+        }
+        let mut block = vec![0; PAGE as usize];
+        while !out.is_empty() {
+            let page = self.base_page(offset);
+            let start = self.base_start + page as u64 * PAGE;
+            let within = (offset - start) as usize;
+            let count = out.len().min(block.len() - within);
+            if is_verified(&verified, page) {
+                read_exact(self.base, offset, &mut out[..count])?;
+            } else {
+                read_exact(self.base, start, &mut block)?;
+                self.verify_page(page, &block, &mut verified)?;
+                out[..count].copy_from_slice(&block[within..within + count]);
+            }
+            offset += count as u64;
+            out = &mut out[count..];
         }
         Ok(())
     }
@@ -302,12 +382,12 @@ impl<'a, B: PRead, P: PRead> View<'a, B, P> {
             let relative = at - self.image.pfs.start;
             let index = (relative / PAGE) as usize;
             let within = relative % PAGE;
-            let block = self.blocks[index].offset;
+            let block = self.blocks[index];
             let source = if block & PATCH != 0 { Source::Patch } else { Source::Base };
             let mut end = index + 1;
             // Limit coalescing. Readers normally request at most one Kraken block.
             while end < self.blocks.len() && end - index < 16 &&
-                self.blocks[end].offset == block + (end - index) as u64 * PAGE
+                self.blocks[end] == block + (end - index) as u64 * PAGE
             {
                 end += 1;
             }
@@ -330,7 +410,7 @@ impl<B: PRead, P: PRead> PRead for View<'_, B, P> {
             let size = (out.len() - done).min(run.len as usize);
             let bytes = &mut out[done..done + size];
             match run.source {
-                Source::Base => read_exact(self.base, run.offset, bytes)?,
+                Source::Base => self.read_base(run.offset, bytes)?,
                 Source::Patch => read_exact(self.patch, run.offset, bytes)?,
             }
             done += size;

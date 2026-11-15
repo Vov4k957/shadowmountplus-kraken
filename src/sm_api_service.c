@@ -126,6 +126,13 @@ typedef struct {
   char target[MAX_PATH];
 } usb_eject_blocker_t;
 
+typedef enum {
+  KRAKEN_MOUNT,
+  KRAKEN_FAST_PATCH,
+  KRAKEN_RELINK,
+  KRAKEN_RELINK_BASE,
+} kraken_action_t;
+
 typedef struct {
   pthread_mutex_t mutex;
   pthread_cond_t cond;
@@ -152,6 +159,7 @@ typedef struct {
   uint64_t finished_us;
   size_t affected_titles;
   uint32_t kraken_phase;
+  kraken_action_t kraken_action;
   int result_status;
   char result_error_reason[32];
   usb_eject_blocker_t usb_blocker;
@@ -1056,6 +1064,7 @@ typedef struct {
   const char *image_type;
   bool image_backed;
   bool kraken;
+  kraken_action_t kraken_action;
   uint64_t usb_mount_id;
 } game_source_info_t;
 
@@ -1354,9 +1363,14 @@ static struct json_object *game_to_json(
   const char *content_id = metadata ? metadata->content_id : "";
   const char *version = metadata ? metadata->version : "";
   sm_pkg_info_t mounted_pkg;
-  if (source_info.kraken && sm_pkg_read_directory_metadata(source->path, &mounted_pkg) &&
-      mounted_pkg.app_ver[0])
-    version = mounted_pkg.app_ver;
+  if (source_info.kraken && sm_pkg_read_directory_metadata(source->path, &mounted_pkg)) {
+    if (mounted_pkg.app_ver[0])
+      version = mounted_pkg.app_ver;
+    if (mounted_pkg.content_id[0])
+      content_id = mounted_pkg.content_id;
+  }
+  char lih_source[MAX_PATH];
+  bool lih_applied = source_info.kraken && sm_kraken_patch_source(source->path, lih_source);
   const char *last_access_time = metadata ? metadata->last_access_time : "";
   const char *install_time = metadata ? metadata->install_time : "";
   const char *platform = game_platform_name(source->title_id, metadata);
@@ -1395,6 +1409,7 @@ static struct json_object *game_to_json(
   }
   if (!add_json_bool(item, "installed_pkg", installed_pkg) ||
       !add_json_bool(item, "can_uninstall", installed) ||
+      !add_json_bool(item, "kraken_patch_applied", lih_applied) ||
       !add_json_bool(item, "can_manage_source", !installed_pkg && !source_info.kraken) ||
       !add_json_bool(item, "can_toggle_fakelib", can_toggle_fakelib) ||
       !add_json_bool(item, "ignore_global_fakelib",
@@ -2224,6 +2239,7 @@ static const char *operation_error_message(int status, const char *reason) {
       {"kraken_patch_invalid", "LIH update does not match a supported base PKG or failed validation; see the debug log"},
       {"kraken_decode_failed", "failed to decode a Kraken block; see the debug log"},
       {"kraken_base_missing", "mount the matching base PKG with U first"},
+      {"kraken_patch_source_missing", "the recorded LIH file is unavailable; choose the base-only recovery or restore the update file"},
       {"kraken_base_invalid", "the base PKG could not be mounted; see the debug log"},
       {"kraken_title_conflict", "another source is already registered for this title"},
       {"kraken_use_mount", "use U for a compatible mounted update or use a system-installed base"},
@@ -4134,8 +4150,10 @@ static void update_kraken_job(void *ctx, uint32_t phase, uint64_t done, uint64_t
 }
 
 static void run_kraken_job(uint64_t job_id, const char *title_id,
-                           const char *source, const char *expected_base) {
+                           const char *source, const char *expected_base,
+                           kraken_action_t action) {
   bool update = expected_base[0] != '\0';
+  bool relink = action == KRAKEN_RELINK || action == KRAKEN_RELINK_BASE;
   const char *error = runtime_mutation_block_reason();
   bool scanner = false, runtime = false;
   int status = error ? EBUSY : 0;
@@ -4162,12 +4180,13 @@ static void run_kraken_job(uint64_t job_id, const char *title_id,
   bool managed = !status && read_mount_link(title_id, cache, sizeof(cache));
   bool kraken = managed && sm_kraken_source(cache, base_path);
   if (!status && update && (!registered || !kraken ||
-      strcmp(expected_base, base_path) != 0)) {
+      strcmp(expected_base, base_path) != 0 || !sm_kraken_source_ready(cache))) {
     status = ENOENT;
     error = "kraken_base_missing";
   }
-  if (!status && !update && ((managed && !kraken) ||
-      (registered && (!kraken || strcmp(source, base_path) != 0)))) {
+  if (!status && !update && ((relink && (!registered || !kraken)) ||
+      (managed && !kraken) ||
+      (registered && (!kraken || (!relink && strcmp(source, base_path) != 0))))) {
     status = EEXIST;
     error = "kraken_title_conflict";
   }
@@ -4187,9 +4206,10 @@ static void run_kraken_job(uint64_t job_id, const char *title_id,
   if (!status) {
     sm_kraken_job_t job = {
       .cancelled = storage_job_cancelled, .finalize = begin_storage_job_finalizing,
-      .progress = update_kraken_job, .ctx = ctx,
+      .progress = update_kraken_job, .ctx = ctx, .fast = action == KRAKEN_FAST_PATCH,
     };
     bool ready = update ? sm_kraken_apply_patch(&base, &patch, &job)
+                        : relink ? sm_kraken_relink_base(&base, &job, cache, action == KRAKEN_RELINK)
                         : sm_kraken_prepare_base(&base, &job, cache);
     if (!ready) {
       status = errno ? errno : EIO;
@@ -4197,6 +4217,10 @@ static void run_kraken_job(uint64_t job_id, const char *title_id,
         error = "kraken_sources_changed";
       else if (status == EILSEQ)
         error = "kraken_decode_failed";
+      else if (action == KRAKEN_RELINK && status == ENOENT)
+        error = "kraken_patch_source_missing";
+      else if (relink && status == EEXIST)
+        error = "kraken_title_conflict";
       else if (status == EINVAL)
         error = update ? "kraken_patch_invalid" : "kraken_base_invalid";
     } else if (!update) {
@@ -4241,6 +4265,7 @@ static void *storage_job_thread_main(void *arg) {
                 sizeof(destination));
   delete_source = g_storage_job.delete_source;
   operation = g_storage_job.operation;
+  kraken_action_t kraken_action = g_storage_job.kraken_action;
   usb_mount_id = g_storage_job.usb_mount_id;
   backport = strcmp(g_storage_job.source_type, "backport") == 0;
   browser_delete = operation == GAME_STORAGE_DELETE && !title_id[0];
@@ -4251,7 +4276,7 @@ static void *storage_job_thread_main(void *arg) {
     return NULL;
   }
   if (operation == GAME_STORAGE_MOUNT_PACKAGE) {
-    run_kraken_job(job_id, title_id, source, runtime_source);
+    run_kraken_job(job_id, title_id, source, runtime_source, kraken_action);
     return NULL;
   }
 
@@ -4547,6 +4572,7 @@ static int launch_storage_job(const char *title_id,
   g_storage_job.finished_us = 0;
   g_storage_job.affected_titles = 0;
   g_storage_job.kraken_phase = 0;
+  g_storage_job.kraken_action = source_info->kraken_action;
   g_storage_job.result_status = 0;
   g_storage_job.result_error_reason[0] = '\0';
   memset(&g_storage_job.usb_blocker, 0, sizeof(g_storage_job.usb_blocker));
@@ -4713,13 +4739,34 @@ static void handle_package_mount(struct MHD_Connection *connection,
   game_source_info_t package = {
       .source_type = "kraken",
   };
+  struct json_object *option;
+  if (json_object_object_get_ex(request, "verification", &option)) {
+    const char *verification = package_string(request, "verification");
+    if (info.pkg_kind != PKG_KIND_PATCH || !verification ||
+        (strcmp(verification, "full") != 0 && strcmp(verification, "fast") != 0)) {
+      send_error_response(connection, 400, EINVAL, "invalid LIH verification mode");
+      return;
+    }
+    if (strcmp(verification, "fast") == 0)
+      package.kraken_action = KRAKEN_FAST_PATCH;
+  }
+  if (json_object_object_get_ex(request, "relink", &option)) {
+    const char *relink = package_string(request, "relink");
+    if (info.pkg_kind != PKG_KIND_BASE || !relink ||
+        (strcmp(relink, "keep_patch") != 0 && strcmp(relink, "base_only") != 0)) {
+      send_error_response(connection, 400, EINVAL, "invalid base PKG recovery mode");
+      return;
+    }
+    package.kraken_action = strcmp(relink, "base_only") == 0 ? KRAKEN_RELINK_BASE : KRAKEN_RELINK;
+  }
   if (info.pkg_kind == PKG_KIND_PATCH) {
     if (!sm_kraken_can_apply_patch(&info)) {
       send_operation_error_response(connection, EINVAL, "kraken_patch_invalid");
       return;
     }
     char cache[MAX_PATH];
-    if (!registered_kraken_base(info.title_id, cache, package.runtime_path)) {
+    if (!registered_kraken_base(info.title_id, cache, package.runtime_path) ||
+        !sm_kraken_source_ready(cache)) {
       send_operation_error_response(connection, ENOENT, "kraken_base_missing");
       return;
     }
@@ -5061,12 +5108,15 @@ static bool add_package_state(struct json_object *item, const sm_pkg_info_t *inf
   bool use_kraken = kraken && info->is_lih;
   bool mount_patch = use_kraken && sm_kraken_can_apply_patch(info);
   bool patched = kraken && sm_kraken_patch_source(cache, patch);
+  bool relink = kraken && sm_kraken_can_relink(cache, info);
   return add_json_bool(item, "installed", info->pkg_kind == PKG_KIND_BASE && pkg_installed) &&
     add_json_bool(item, "base_installed", base) && add_json_bool(item, "base_queued", queued_base) &&
     add_json_bool(item, "mountable", mount_patch || sm_kraken_can_mount(info)) &&
     add_json_bool(item, "mount_patch", mount_patch) &&
     add_json_bool(item, "kraken_only", use_kraken) &&
     add_json_bool(item, "kraken_patch_applied", patched && !strcmp(info->path, patch)) &&
+    add_json_bool(item, "kraken_relink", relink) &&
+    add_json_bool(item, "kraken_relink_patched", relink && patched) &&
     add_json_bool(item, "kraken_restore_base", patched && !strcmp(info->path, backing)) &&
     add_package_icon_info(item, info);
 }

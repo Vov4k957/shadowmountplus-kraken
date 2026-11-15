@@ -1205,6 +1205,7 @@
       <p class="confirm-message" id="confirmMessage"></p>
       <div class="modal-actions">
         <button class="btn" id="confirmCancel" type="button" data-cancel data-i18n="cancel">Cancel</button>
+        <button class="btn" id="confirmAlternative" type="button" hidden></button>
         <button class="btn danger" id="confirmAccept" type="button" data-i18n="continueAction">Continue</button>
       </div>
     </div>
@@ -1283,8 +1284,17 @@
           packageUpdate: "Update",
           krakenApplyPatch: "Mount with this update",
           krakenRestoreBase: "Mount the base game",
-          krakenApplyConfirm: "Apply this update to the mounted game?\n\n{path}",
+          krakenApplyConfirm: "Full checks every required base block. Fast checks the base blocks used to build the cache. A damaged block read while playing may only be detected then.\n\n{path}",
+          krakenFullVerify: "Full check",
+          krakenFastVerify: "Fast",
           krakenRestoreConfirm: "Switch to the base package? The update file will be kept.",
+          krakenDetach: "Remove LIH",
+          krakenRelink: "Relink PKG",
+          krakenFindBase: "Find base PKG",
+          krakenFindBaseHint: "Open the folder with the moved base PKG and press U next to the game.",
+          krakenRelinkConfirm: "Use this file as the source for the registered game?\n\n{path}",
+          krakenRelinkPatchConfirm: "Relink the game and keep its LIH update, or relink with the base version.\n\n{path}",
+          krakenPatchSourceMissing: "The applied LIH file is unavailable. Restore its original path, or press U on the base PKG and choose Remove LIH.",
           krakenPatchApplied: "Update applied",
           krakenPatchInvalid: "Could not apply this LIH update. Check that it matches the original base PKG and see the debug log.",
           krakenDecodeFailed: "Could not decode a Kraken block. See the debug log for the file and block details.",
@@ -1606,8 +1616,17 @@
           packageUpdate: "Обновить",
           krakenApplyPatch: "Смонтировать с этим обновлением",
           krakenRestoreBase: "Смонтировать базовую версию",
-          krakenApplyConfirm: "Применить это обновление к смонтированной игре?\n\n{path}",
+          krakenApplyConfirm: "Полная проверка охватывает все нужные блоки базы. Быстрая проверяет блоки, которые SMP читает при сборке. Ошибка в остальных блоках может проявиться при запуске или в игре.\n\n{path}",
+          krakenFullVerify: "Полная проверка",
+          krakenFastVerify: "Быстро",
           krakenRestoreConfirm: "Вернуться к базовому пакету? Файл обновления сохранится.",
+          krakenDetach: "Снять LIH",
+          krakenRelink: "Перепривязать PKG",
+          krakenFindBase: "Указать базовый PKG",
+          krakenFindBaseHint: "Откройте папку с перенесённым базовым PKG и нажмите U рядом с игрой.",
+          krakenRelinkConfirm: "Использовать этот файл для уже зарегистрированной игры?\n\n{path}",
+          krakenRelinkPatchConfirm: "Перепривязать игру с сохранением LIH или вернуться к базовой версии.\n\n{path}",
+          krakenPatchSourceMissing: "Файл применённого LIH недоступен. Верните его на прежнее место или нажмите U на базовом PKG и выберите «Снять LIH».",
           krakenPatchApplied: "Обновление применено",
           krakenPatchInvalid: "Не удалось применить LIH-патч. Проверьте, подходит ли он к исходному базовому PKG, и откройте журнал отладки.",
           krakenDecodeFailed: "Не удалось распаковать блок Kraken. Имя файла и параметры блока есть в журнале отладки.",
@@ -3236,6 +3255,7 @@
         pkg_invalid: "packageInvalid", pkg_base_missing: "packageBaseMissing", pkg_already_installed: "packageInstalled", pkg_queued: "packageQueued", pkg_queue_full: "packageQueueFull",
         pkg_stream_lost: "packageStreamLost", pkg_source_changed: "sourceUnavailable",
         kraken_patch_invalid: "krakenPatchInvalid", kraken_decode_failed: "krakenDecodeFailed", kraken_base_missing: "krakenBaseMissing",
+        kraken_patch_source_missing: "krakenPatchSourceMissing",
         kraken_base_invalid: "krakenBaseInvalid", kraken_title_conflict: "krakenTitleConflict",
         kraken_use_mount: "krakenUseMount", kraken_sources_changed: "krakenSourcesChanged"
       };
@@ -4434,6 +4454,21 @@
         const runtimeAction = appendRuntimeActions(actions, game);
         if (runtimeAction) runtimeAction.className += " primary";
         const destructive = [];
+        if (game.source_type === "pkg" && !game.installed_pkg) {
+          if (!game.source_available) {
+            actions.append(actionButton(t("krakenFindBase"), () => {
+              closeModal();
+              switchView("packages");
+              toast(t("krakenFindBaseHint"));
+            }));
+          } else if (game.kraken_patch_applied) {
+            const detach = actionButton(t("krakenDetach"),
+              () => mountPackage({ path: game.path, kraken_restore_base: true }),
+              "danger content-delete");
+            detach.disabled = Boolean(state.storageJob?.active);
+            destructive.push(detach);
+          }
+        }
         if (game.patch_info_status === 0 && game.patch?.installed) {
           destructive.push(actionButton(t("deletePatch"), () => uninstallContent(game), "danger content-delete"));
         }
@@ -4851,9 +4886,12 @@
         await startStorageJob(game, "delete", { title_id: game.title_id, confirm: true });
       }
 
-      function confirmAction(message) {
+      function confirmAction(message, acceptLabel = t("continueAction"), alternativeLabel = "") {
         if (confirmResolve) return Promise.resolve(false);
         $("confirmMessage").textContent = message;
+        $("confirmAccept").textContent = acceptLabel;
+        $("confirmAlternative").textContent = alternativeLabel;
+        $("confirmAlternative").hidden = !alternativeLabel;
         $("confirmModal").hidden = false;
         return new Promise(resolve => { confirmResolve = resolve; });
       }
@@ -5360,6 +5398,7 @@
           if (entry.mountable) {
             const mount = actionButton("U", () => mountPackage(entry), "package-mount");
             const mountLabel = t(entry.mount_patch ? "krakenApplyPatch" :
+              entry.kraken_relink ? "krakenRelink" :
               entry.kraken_restore_base ? "krakenRestoreBase" : "packageMount");
             mount.setAttribute("aria-label", mountLabel);
             mount.title = mountLabel;
@@ -5419,11 +5458,24 @@
       }
 
       async function mountPackage(entry) {
-        const confirmation = entry.mount_patch ? "krakenApplyConfirm" :
-          entry.kraken_restore_base ? "krakenRestoreConfirm" : null;
-        if (confirmation && !await confirmAction(t(confirmation, { path: entry.path }))) return;
+        const request = { path: entry.path };
+        if (entry.mount_patch) {
+          const mode = await confirmAction(t("krakenApplyConfirm", request),
+            t("krakenFullVerify"), t("krakenFastVerify"));
+          if (!mode) return;
+          request.verification = mode === "alternative" ? "fast" : "full";
+        } else if (entry.kraken_relink) {
+          const mode = await confirmAction(t(entry.kraken_relink_patched ? "krakenRelinkPatchConfirm" : "krakenRelinkConfirm", request),
+            t("krakenRelink"), entry.kraken_relink_patched ? t("krakenDetach") : "");
+          if (!mode) return;
+          request.relink = mode === "alternative" ? "base_only" : "keep_patch";
+        } else if (entry.kraken_restore_base &&
+          !await confirmAction(t("krakenRestoreConfirm"), t("krakenDetach"))) {
+          return;
+        }
         try {
-          const job = await api("/packages/mount", { path: entry.path });
+          const job = await api("/packages/mount", request);
+          if (!$("modal").hidden) closeModal();
           renderStorageJob(job);
           scheduleStorageJobPoll();
           focusControl($("cancelTransfer"));
@@ -6036,6 +6088,7 @@
       ["libraryTab", "libraryHome"].forEach(id => $(id).addEventListener("click", () => switchView("library")));
       $("confirmCancel").addEventListener("click", () => finishConfirmation(false));
       $("confirmAccept").addEventListener("click", () => finishConfirmation(true));
+      $("confirmAlternative").addEventListener("click", () => finishConfirmation("alternative"));
       $("confirmModal").addEventListener("click", event => { if (event.target === $("confirmModal")) finishConfirmation(false); });
       $("consoleTab").addEventListener("click", () => switchView("console"));
       document.querySelectorAll("[data-console-section]").forEach(button => {
