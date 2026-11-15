@@ -543,8 +543,11 @@ is marked `kraken_patch_applied=true`; applying the base path again when
 When the recorded base is unavailable or its fingerprint is stale, a base
 PKG for the same content can advertise `kraken_relink=true`. Submit the
 new base path with `"relink":"keep_patch"` to restore the registration's
-source and retain the applied LIH. A rename on the same volume can reuse
-the cache. A replacement file that requires rebuilding also needs the
+source and retain the applied LIH. A rename or a copy with a matching
+package ID can reuse the cache across drives. The ID covers the size, FIH
+and CNT metadata, the image digest table when present, and the last page.
+Existing caches record an ID on launch while their original base is
+available. A replacement file that requires rebuilding also needs the
 recorded LIH to be available. `"relink":"base_only"` switches to the new
 path and detaches the LIH. This keeps the registered title and the source
 packages. Library items expose the applied LIH through `kraken_patch_applied`.

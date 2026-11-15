@@ -348,6 +348,51 @@ fn make_patch(base: &[u8], target: &[u8]) -> TestRead {
 }
 
 #[test]
+fn base_pkg_mounts_a_hole_that_wraps_the_block_window() {
+    let size = BLOCK + PAGE;
+    let raw = vec![0x37; 2 * PAGE];
+    let mut pkg = synthetic_pkg_with_assets(size, &raw, None);
+    let metadata = size + PAGE;
+    let stored = raw.len() + PAGE;
+    let lengths = [128, 128, 128, PAGE - 384];
+    let mut bounds = vec![(0, 0), (raw.len(), 0x40)];
+    let mut records = vec![0, kraken_record(0, raw.len(), raw.len())];
+    let mut end = raw.len();
+    for (slot, n) in lengths.into_iter().enumerate() {
+        end += n;
+        let logical = size + slot * 128;
+        bounds.push((logical, 0));
+        records.push(kraken_record(logical, end, n));
+    }
+    bounds.extend([(metadata, 0), (metadata + 3 * PAGE, 0x40)]);
+    records.extend([kraken_record(metadata, stored + 3 * PAGE, 3 * PAGE) | RUN_END, 1 << 67, 0]);
+    set_layout(&mut pkg, metadata + 3 * PAGE, &bounds, &records, 0);
+
+    let mut io = TestIo { pkg, files: BTreeMap::new() };
+    let reader = PackageIo { context: ptr::from_mut(&mut io).cast(), read, write, loose_size };
+    prepare(&reader, io.pkg.len() as u64, 0, "wrapped-hole.pkg").unwrap();
+    let file = &io.files["zero.bin"];
+    assert_eq!(file.len(), size);
+    assert_eq!(&file[..raw.len()], &raw);
+    assert!(file[raw.len()..].iter().all(|&byte| byte == 0));
+}
+
+#[test]
+fn package_id_uses_image_digests_outside_the_header_and_tail_samples() {
+    use super::lih::package_id;
+
+    let mut pkg = TestRead(with_digests(synthetic_pkg(BLOCK), b"EP0000-PPSA01234_00-SYNTHETICPACKAGE"));
+    let cnt = get64(&pkg.0, 0x58) as usize;
+    pkg.0.resize(pkg.0.len() + 2 * PAGE, 0);
+    let len = pkg.0.len() as u64;
+    let id = package_id(&pkg, len).unwrap();
+    let copy = TestRead(pkg.0.clone());
+    assert_eq!(id, package_id(&copy, len).unwrap());
+    pkg.0[cnt + 0x300 + 32] ^= 1;
+    assert_ne!(id, package_id(&pkg, len).unwrap());
+}
+
+#[test]
 fn lih_reads_updated_asset_and_preserves_sparse_chunks() {
     check_lih(b"EP0000-PPSA01234_00-SYNTHETICPACKAGE", b"russian audio data");
 }

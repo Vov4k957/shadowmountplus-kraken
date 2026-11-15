@@ -93,7 +93,7 @@ struct Container {
     digests: Vec<BlockDigest>,
 }
 
-fn container(io: &impl PRead, file: Range<u64>, blocks: usize) -> Result<Container, Error> {
+fn container_metadata(io: &impl PRead, file: &Range<u64>) -> Result<(Vec<u8>, Vec<u8>), Error> {
     let size = file.end - file.start;
     region(0, CNT_HEADER_SIZE as u64, size)?;
     let mut header = vec![0; CNT_HEADER_SIZE];
@@ -108,13 +108,25 @@ fn container(io: &impl PRead, file: Range<u64>, blocks: usize) -> Result<Contain
     let table = region(u64::from(be32(&header, 0x18)), (count * ENTRY_SIZE) as u64, size)?;
     let mut rows = vec![0; count * ENTRY_SIZE];
     read_exact(io, file.start + table.start, &mut rows)?;
-    let row = rows.chunks_exact(ENTRY_SIZE).find(|row| be32(row, 0) == IMAGE_DIGESTS)
-        .ok_or_else(|| corrupt("missing imagedigs in CNT container"))?;
+    Ok((header, rows))
+}
+
+fn image_digest_range(rows: &[u8], size: u64, blocks: usize) -> Result<Option<Range<u64>>, Error> {
+    let Some(row) = rows.chunks_exact(ENTRY_SIZE).find(|row| be32(row, 0) == IMAGE_DIGESTS) else {
+        return Ok(None);
+    };
     let bytes = blocks as u64 * 32;
     if u64::from(be32(row, 20)) != bytes || be32(row, 8) & 0x8000_0000 != 0 {
         return Err(corrupt("invalid imagedigs in CNT container"));
     }
-    let at = file.start + region(u64::from(be32(row, 16)), bytes, size)?.start;
+    region(u64::from(be32(row, 16)), bytes, size).map(Some)
+}
+
+fn container(io: &impl PRead, file: Range<u64>, blocks: usize) -> Result<Container, Error> {
+    let (header, rows) = container_metadata(io, &file)?;
+    let digests = image_digest_range(&rows, file.end - file.start, blocks)?
+        .ok_or_else(|| corrupt("missing imagedigs in CNT container"))?;
+    let at = file.start + digests.start;
     let mut digests = Vec::with_capacity(blocks);
     let mut batch = vec![0; PAGE as usize];
     while digests.len() < blocks {
@@ -128,6 +140,48 @@ fn container(io: &impl PRead, file: Range<u64>, blocks: usize) -> Result<Contain
     }
     let content_id = header[0x40..0x64].try_into().unwrap();
     Ok(Container { content_id, digests })
+}
+
+/// Identify the same container after a copy, independent of its filesystem times.
+/// Read the image digest table when present so different image layouts or data
+/// advertised by the container produce different IDs without hashing the whole file.
+pub fn package_id(io: &impl PRead, len: u64) -> Result<[u8; 32], Error> {
+    if len < PAGE {
+        return Err(corrupt("package is shorter than its FIH header page"));
+    }
+    let mut hash = Sha3_256::new();
+    hash.update(b"SMP Kraken package ID v1");
+    hash.update(len.to_le_bytes());
+    let mut page = vec![0; PAGE as usize];
+    read_exact(io, 0, &mut page)?;
+    if &page[..4] != b"\x7fFIH" || page[5] != 0 {
+        return Err(unsupported("expected a debug FIH base package"));
+    }
+    hash.update(&page);
+    let cnt = le64(&page, 0x58);
+    let image = Image::read(io, 0).ok();
+    let cnt_end = image.as_ref().filter(|image| cnt < image.pfs.start)
+        .map_or(len, |image| image.pfs.start.min(len));
+    if cnt < PAGE || cnt >= cnt_end {
+        return Err(corrupt("CNT lies outside the package"));
+    }
+    let (header, rows) = container_metadata(io, &(cnt..cnt_end))?;
+    hash.update(&header);
+    hash.update(&rows);
+    if let Some(image) = image {
+        if let Some(range) = image_digest_range(&rows, cnt_end - cnt, image.blocks())? {
+            let mut at = range.start;
+            while at < range.end {
+                let count = (range.end - at).min(PAGE) as usize;
+                read_exact(io, cnt + at, &mut page[..count])?;
+                hash.update(&page[..count]);
+                at += count as u64;
+            }
+        }
+    }
+    read_exact(io, len - PAGE, &mut page)?;
+    hash.update(&page);
+    Ok(hash.finalize().into())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

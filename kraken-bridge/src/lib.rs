@@ -158,13 +158,20 @@ impl PackageIo {
         if entry.size == 0 {
             return self.output(path, 0, &[]).map_err(Into::into);
         }
+        let sparse = pkg.has_sparse(entry);
         let mut offset = 0;
         while offset < entry.size {
             let length = pkg.read_at(reader, entry, offset, buf).map_err(|error| BuildError::file(path, error))?;
             if length == 0 || length as u64 > entry.size - offset {
                 return Err(format!("{path}: short package read").into());
             }
-            self.output(path, offset, &buf[..length])?;
+            if sparse && buf[..length].iter().all(|&byte| byte == 0) {
+                if offset + length as u64 == entry.size {
+                    self.output(path, entry.size - 1, &[0])?;
+                }
+            } else {
+                self.output(path, offset, &buf[..length])?;
+            }
             offset += length as u64;
         }
         Ok(())
@@ -202,8 +209,17 @@ impl PatchCache<'_> {
 fn prepare(io: &PackageIo, size: u64, mtime: i64, basename: &str) -> Result<(), BuildError> {
     let pkg = Pkg::open(io, size)?;
     prepare_package(io, io, &pkg, size, mtime, basename, |_, _| {}, |_, entry, _, _| {
-        let blocks = pkg.blocks(entry)?;
-        Ok(blocks.iter().map(|block| original_chunk(block, block.pkg_off)).collect())
+        let sparse = pkg.has_sparse(entry);
+        let blocks = match pkg.blocks(entry) {
+            Ok(blocks) => blocks,
+            Err(Error::Unsupported(_)) if sparse => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let chunks: Vec<_> = blocks.iter().map(|block| original_chunk(block, block.pkg_off)).collect();
+        if sparse && !ampr_index::packable(entry.size, &chunks, size) {
+            return Ok(None);
+        }
+        Ok(Some(chunks))
     })
 }
 
@@ -264,7 +280,7 @@ fn prepare_patched(io: &PackageIo, patch: &impl PRead, size: u64, patch_size: u6
                 chunks.push(cache.append(buffer)?);
             }
         }
-        Ok(chunks)
+        Ok(Some(chunks))
     })?;
     view.save_verification(verification);
     Ok(())
@@ -273,7 +289,7 @@ fn prepare_patched(io: &PackageIo, patch: &impl PRead, size: u64, patch_size: u6
 fn prepare_package(
     io: &PackageIo, reader: &impl PRead, pkg: &Pkg, size: u64, mtime: i64, basename: &str,
     progress: impl Fn(u64, u64),
-    mut chunks_for_file: impl FnMut(&Pkg, &Entry<'_>, &mut PatchCache<'_>, &mut [u8]) -> Result<Vec<Chunk>, BuildError>,
+    mut chunks_for_file: impl FnMut(&Pkg, &Entry<'_>, &mut PatchCache<'_>, &mut [u8]) -> Result<Option<Vec<Chunk>>, BuildError>,
 ) -> Result<(), BuildError> {
     for path in REQUIRED_FILES {
         if !pkg.lookup(path).is_some_and(|entry| !entry.is_dir && entry.size > 0) {
@@ -320,12 +336,12 @@ fn prepare_package(
             lower.ends_with(".prx") || lower.ends_with(".sprx");
         let (length, chunks) = if let Some(length) = loose {
             (length, None)
-        } else if extract {
-            io.extract(reader, pkg, &entry, entry.path, &mut buffer)?;
-            (entry.size, None)
         } else {
-            let chunks = chunks_for_file(pkg, &entry, &mut cache, &mut buffer)?;
-            (entry.size, Some(chunks))
+            let chunks = if extract { None } else { chunks_for_file(pkg, &entry, &mut cache, &mut buffer)? };
+            if chunks.is_none() {
+                io.extract(reader, pkg, &entry, entry.path, &mut buffer)?;
+            }
+            (entry.size, chunks)
         };
         files.insert(lower, IndexFile { path: String::from(entry.path), size: length, chunks });
     }
@@ -352,6 +368,15 @@ fn package_basename(bytes: &[u8]) -> Result<&str, BuildError> {
         return Err(String::from("invalid package basename").into());
     }
     Ok(name)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sm_kraken_package_id(context: *mut c_void, size: u64,
+                                              read: Read, output: *mut u8) -> bool {
+    let reader = CallbackReader { context, read };
+    let Ok(id) = lih::package_id(&reader, size) else { return false };
+    unsafe { ptr::copy_nonoverlapping(id.as_ptr(), output, id.len()); }
+    true
 }
 
 /// C retains ownership of the context and buffers for the duration of this call.

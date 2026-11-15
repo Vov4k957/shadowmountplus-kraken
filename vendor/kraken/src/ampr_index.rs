@@ -258,6 +258,12 @@ fn plan(path: &str, size: u64, blocks: &[Chunk], vol_size: u64, aux_size: u64, z
     Ok(Plan { chunks, flags: FILE_PACKED })
 }
 
+// Sparse spans that cross the file's 256 KiB grid need a loose file.
+pub fn packable(size: u64, blocks: &[Chunk], pkg_size: u64) -> bool {
+    let volume_size = pkg_size.next_multiple_of(PAGE).max(2 * PAGE);
+    plan("", size, blocks, volume_size, 0, PAGE).is_ok()
+}
+
 fn write_pack_record(record: &mut [u8], payload_len: u64, name_at: u32, name_len: u32) {
     put64(record, 0, payload_len);
     put64(record, 8, PAGE + payload_len);

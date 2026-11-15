@@ -137,6 +137,14 @@ impl Boundaries {
         self.offsets.get(index).copied().unwrap_or(self.mount)
     }
 
+    fn after_sparse(&self, start: u64) -> Option<u64> {
+        let mut end = start;
+        while self.sparse.binary_search(&end).is_ok() {
+            end = self.next(end);
+        }
+        (end != start).then_some(end)
+    }
+
     // Kind 0x40 marks a zero-filled span up to the next boundary, as in Dump Forge.
     // It consumes no stored bytes and has no record in the block stream.
     fn append_sparse(&self, logical: &mut u64, blocks: &mut Vec<KBlock>) {
@@ -299,20 +307,29 @@ impl Kraken {
             let next = if f(66, 1) == 1 { i + 2 } else { i + 1 };
             let mut possible = None;
             let len = if next + 1 < records {
-                let at16 = (logical & !(WINDOW - 1)) | ((rec.get(next)? as u64 & 0x3FFF) << 4);
-                let at16 = if at16 <= logical & !0xF { at16 + WINDOW } else { at16 };
-                // When there is no exact nibble, the next record supplies a bucket of
-                // 16 offsets. A nearby file boundary is exact and still takes precedence.
-                if verify_lengths.is_some() && at16 < cap && at16 + 16 <= boundary {
-                    let min = (at16 - logical) as u32;
-                    let max = (cap.min(at16 + 15) - logical) as u32;
-                    if min < max {
-                        possible = Some(min..=max);
-                    }
-                }
+                let at14 = rec.get(next)? as u64 & 0x3FFF;
                 let low = if strict { (rec.get(next - 1)? >> 68) as u64 & 0xF } else { logical & 0xF };
-                let exact = at16 | low;
-                if at16 + 16 <= cap || (strict && exact < cap) { exact - logical } else { cap - logical }
+                // A record after a hole can wrap into this window. Its offset
+                // describes where to resume reading, not where this block ends.
+                if bounds.after_sparse(cap).is_some_and(|end| {
+                    (end % WINDOW) >> 4 == at14 && (!strict || end & 0xF == low)
+                }) {
+                    cap - logical
+                } else {
+                    let at16 = (logical & !(WINDOW - 1)) | (at14 << 4);
+                    let at16 = if at16 <= logical & !0xF { at16 + WINDOW } else { at16 };
+                    // When there is no exact nibble, the next record supplies a bucket of
+                    // 16 offsets. A nearby file boundary is exact and still takes precedence.
+                    if verify_lengths.is_some() && at16 < cap && at16 + 16 <= boundary {
+                        let min = (at16 - logical) as u32;
+                        let max = (cap.min(at16 + 15) - logical) as u32;
+                        if min < max {
+                            possible = Some(min..=max);
+                        }
+                    }
+                    let exact = at16 | low;
+                    if at16 + 16 <= cap || (strict && exact < cap) { exact - logical } else { cap - logical }
+                }
             } else {
                 cap - logical
             };

@@ -2186,6 +2186,9 @@ static bool mount_fakelib_for_game_locked(pid_t pid, const char *title_id,
     }
   }
 
+  if (kraken && !sm_kraken_refresh_runtime(managed_game_path))
+    log_debug("  [FAKELIB] Kraken runtime refresh failed for %s: %s", title_id, strerror(errno));
+
   if (fakelib_enabled && !kraken) {
     pthread_mutex_lock(&g_fakelib_cache_mutex);
     if (!managed_title && sandbox_resolved &&

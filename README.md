@@ -402,10 +402,10 @@ Run these commands from a clean checkout. An SMP update merges the source histor
 
 ```bash
 bash tools/sync-upstream.sh smp
-bash tools/sync-upstream.sh kraken v0.0.1-beta
+bash tools/sync-upstream.sh kraken v0.2.0
 ```
 
-Replace `v0.0.1-beta` with the Kraken release tag you want to test. The imported commit is recorded in `vendor/kraken/REVISION`. The PS5 build uses the vendored version so that a release rebuild selects the same reader and runtime.
+Replace `v0.2.0` with the Kraken release tag you want to test. The imported commit is recorded in `vendor/kraken/REVISION`. The PS5 build uses the vendored version so that a release rebuild selects the same reader and runtime.
 
 ## Credits
 

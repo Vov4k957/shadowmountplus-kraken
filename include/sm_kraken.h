@@ -34,6 +34,8 @@ bool sm_kraken_patch_source(const char *cache, char path[MAX_PATH]);
 bool sm_kraken_source(const char *cache, char path[MAX_PATH]);
 // Ejects and manual removals check the backing source without traversing the cache.
 bool sm_kraken_source_ready(const char *cache);
+// Refresh the bundled module in a compatible cache before mounting its fakelib.
+bool sm_kraken_refresh_runtime(const char *cache);
 // Report and recover a registered cache whose selected base path is stale.
 bool sm_kraken_can_relink(const char *cache, const sm_pkg_info_t *base);
 bool sm_kraken_relink_base(const sm_pkg_info_t *base, const sm_kraken_job_t *job,
