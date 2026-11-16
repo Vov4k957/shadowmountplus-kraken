@@ -19,6 +19,7 @@
 #define KRAKEN_MANIFEST ".smp-kraken-built"
 #define KRAKEN_REVISION "2"
 #define KRAKEN_INITIAL_READER "a20bb8be4578f4826e253e3e6f0ed94e1476683c"
+#define KRAKEN_V020_READER "73cc894b88338b617dfe8b173585e94db78cd348"
 #define KRAKEN_PATCH_REVISION "5"
 #define KRAKEN_PATCH_FAST_REVISION "5-fast"
 #define KRAKEN_PATCH_VOLUME ".smp-kraken-patch.pak"
@@ -250,7 +251,7 @@ static const char *signature_reader(const char *signature, const char *format) {
   if (strncmp(signature, format, prefix) || signature[prefix] != ' ')
     return NULL;
   const char *reader = signature + prefix + 1;
-  const char *readers[] = {sm_kraken_revision, KRAKEN_INITIAL_READER};
+  const char *readers[] = {sm_kraken_revision, KRAKEN_V020_READER, KRAKEN_INITIAL_READER};
   for (size_t i = 0; i < sizeof(readers) / sizeof(readers[0]); i++) {
     size_t length = strlen(readers[i]);
     if (!strncmp(reader, readers[i], length) && reader[length] == ' ')
@@ -259,17 +260,19 @@ static const char *signature_reader(const char *signature, const char *format) {
   return NULL;
 }
 
-bool sm_kraken_source_ready(const char *cache) {
-  char source[MAX_PATH], expected[280], saved[280];
+static bool read_ready_source(const char *cache, char source[MAX_PATH], char saved[280],
+                              patch_record_t *patch) {
   char index[MAX_PATH];
-  if (!read_cache_marker(cache, source, saved, sizeof(saved), NULL) ||
+  if (!read_cache_marker(cache, source, saved, 280, patch) ||
       !join_path(cache, "ampr_assets.index", index) || !path_exists(index)) {
     errno = ENOENT;
     return false;
   }
-  struct stat st;
-  if (!package_on_selected_storage(source) || lstat(source, &st) != 0)
-    return false;
+  return package_on_selected_storage(source);
+}
+
+static bool source_stat_matches(const char *saved, const struct stat *st) {
+  char expected[280];
   const char *reader = signature_reader(saved, KRAKEN_REVISION);
   if (!reader) {
     errno = ESTALE;
@@ -278,16 +281,23 @@ bool sm_kraken_source_ready(const char *cache) {
   int written = snprintf(expected, sizeof(expected),
                           "%s %s %llx %llx %llx %llx %lx %llx %lx ",
                           KRAKEN_REVISION, reader,
-                          (unsigned long long)st.st_dev, (unsigned long long)st.st_ino,
-                          (unsigned long long)st.st_size, (unsigned long long)st.st_mtime,
-                          (unsigned long)st.st_mtim.tv_nsec, (unsigned long long)st.st_ctime,
-                          (unsigned long)st.st_ctim.tv_nsec);
-  if (!S_ISREG(st.st_mode) || written <= 0 || (size_t)written >= sizeof(expected) ||
+                          (unsigned long long)st->st_dev, (unsigned long long)st->st_ino,
+                          (unsigned long long)st->st_size, (unsigned long long)st->st_mtime,
+                          (unsigned long)st->st_mtim.tv_nsec, (unsigned long long)st->st_ctime,
+                          (unsigned long)st->st_ctim.tv_nsec);
+  if (!S_ISREG(st->st_mode) || written <= 0 || (size_t)written >= sizeof(expected) ||
       strncmp(saved, expected, (size_t)written) != 0) {
     errno = ESTALE;
     return false;
   }
   return true;
+}
+
+bool sm_kraken_source_ready(const char *cache) {
+  char source[MAX_PATH], saved[280];
+  struct stat st;
+  return read_ready_source(cache, source, saved, NULL) &&
+      lstat(source, &st) == 0 && source_stat_matches(saved, &st);
 }
 
 static bool cancelled(void *unused) {
@@ -353,9 +363,9 @@ static bool make_parents(char *path, size_t root_length) {
   for (char *slash = strchr(path + root_length + 1u, '/'); slash;
        slash = strchr(slash + 1, '/')) {
     *slash = '\0';
-    int created = mkdir(path, 0777);
+    bool ready = mkdir(path, 0777) == 0 ? chmod(path, 0777) == 0 : errno == EEXIST;
     *slash = '/';
-    if (created != 0 && errno != EEXIST)
+    if (!ready)
       return false;
   }
   return true;
@@ -1070,6 +1080,8 @@ static bool prepare_cache(const sm_pkg_info_t *info, const sm_pkg_info_t *patch,
     error = errno ? errno : EIO;
   if (error == 0) {
     remove_staging(backup);
+    if (job->rebuilt)
+      *job->rebuilt = true;
     log_debug("  [KRAKEN] cache ready: %s -> %s", info->path, cache);
     if (patch)
       log_debug("  [KRAKEN] LIH applied: %s %s: %s", patch->title_id,
@@ -1144,6 +1156,83 @@ static bool cached_backport_fingerprint(const char *saved, uint64_t *backport) {
   return true;
 }
 
+static void add_source_access(int fd, mode_t mode, mode_t wanted, const char *path) {
+  if ((mode & wanted) != wanted && fchmod(fd, (mode & 07777) | wanted) != 0)
+    log_debug("  [KRAKEN] could not add read access to %s (%s)", path, strerror(errno));
+}
+
+static bool make_launch_source_readable(const char *cache, const char *source, int fd,
+                                        const char *saved, const patch_record_t *patch) {
+  struct stat before;
+  if (fstat(fd, &before) != 0 || !source_stat_matches(saved, &before))
+    return false;
+  const mode_t wanted = S_IRUSR | S_IRGRP | S_IROTH;
+  if ((before.st_mode & wanted) == wanted)
+    return true;
+
+  const char *reader = signature_reader(saved, KRAKEN_REVISION);
+  uint64_t backport;
+  if (!cached_backport_fingerprint(saved, &backport)) {
+    errno = EINVAL;
+    return false;
+  }
+  if (fchmod(fd, (before.st_mode & 07777) | wanted) != 0) {
+    // Read-only and non-Unix drives can refuse chmod. Let the existing mount try.
+    log_debug("  [KRAKEN] could not add read access to %s (%s)", source, strerror(errno));
+    return true;
+  }
+  struct stat after, named;
+  if (fstat(fd, &after) != 0 || lstat(source, &named) != 0)
+    return false;
+  sm_pkg_info_t updated = {
+    .source_device = before.st_dev,
+    .source_inode = before.st_ino,
+    .source_size = before.st_size,
+    .source_mtime = before.st_mtime,
+    .source_mtime_ns = before.st_mtim.tv_nsec,
+    .source_ctime = after.st_ctime,
+    .source_ctime_ns = after.st_ctim.tv_nsec,
+  };
+  if (!sm_pkg_source_matches(&updated, &after) || !sm_pkg_source_matches(&updated, &named)) {
+    errno = EAGAIN;
+    return false;
+  }
+  // chmod changes ctime. Keep the cached reader version and the applied LIH record.
+  char signature[280];
+  return write_reader_signature(&updated, KRAKEN_REVISION, reader, backport, signature) &&
+      write_cache_marker(cache, source, signature, patch->path[0] ? patch : NULL);
+}
+
+bool sm_kraken_launch_source(const char *cache, char source[MAX_PATH]) {
+  char saved[280];
+  patch_record_t patch = {0};
+  if (!read_ready_source(cache, source, saved, &patch))
+    return false;
+  char parent[MAX_PATH];
+  strlcpy(parent, source, sizeof(parent));
+  char *name = strrchr(parent, '/');
+  if (!name || name == parent) {
+    errno = EINVAL;
+    return false;
+  }
+  *name = '\0';
+  name++;
+  int parent_fd = open(parent, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+  if (parent_fd < 0)
+    return false;
+  int fd = openat(parent_fd, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+  bool ready = fd >= 0 && make_launch_source_readable(cache, source, fd, saved, &patch);
+  int error = ready ? 0 : errno;
+  struct stat st;
+  if (ready && fstat(parent_fd, &st) == 0)
+    add_source_access(parent_fd, st.st_mode, 0555, parent);
+  if (fd >= 0)
+    close(fd);
+  close(parent_fd);
+  errno = error;
+  return ready;
+}
+
 static bool same_package_after_copy(const char *cache, const sm_pkg_info_t *base,
                                      const sm_kraken_job_t *job) {
   package_id_t previous, current;
@@ -1206,13 +1295,14 @@ bool sm_kraken_relink_base(const sm_pkg_info_t *base, const sm_kraken_job_t *job
     return false;
   }
   bool patched = old_patch.path[0] != '\0';
+  const char *reader = signature_reader(saved, KRAKEN_REVISION);
   uint64_t backport;
-  if ((!patched || keep_patch) && cached_backport_fingerprint(saved, &backport) &&
+  if ((!patched || keep_patch) && reader && cached_backport_fingerprint(saved, &backport) &&
       join_path(cache, "ampr_assets.index", index) && path_exists(index) &&
       directory_has_game_executable(cache) &&
       (same_package_after_rename(base, saved) ||
        (strcmp(existing, base->path) != 0 && same_package_after_copy(cache, base, job))) &&
-      write_source_signature(base, KRAKEN_REVISION, backport, updated))
+      write_reader_signature(base, KRAKEN_REVISION, reader, backport, updated))
     return rebind_cache(base, job, cache, existing, updated, patched ? &old_patch : NULL);
 
   if (!keep_patch || !patched)

@@ -36,16 +36,18 @@ def main():
         (build / "launch_helpers.inc").write_text(
             functions(root, "src/sm_shellcore_service.c", names), encoding="utf-8")
         kraken = (root / "src/sm_kraken.c").read_text(encoding="utf-8")
-        marker_constants = re.findall(r"^#define KRAKEN_(?:MARKER|REVISION|INITIAL_READER) .*$", kraken, re.M)
+        marker_constants = re.findall(r"^#define KRAKEN_(?:MARKER|REVISION|INITIAL_READER|V020_READER) .*$", kraken, re.M)
         patch_record = re.search(r"typedef struct \{[^}]+\} patch_record_t;", kraken)[0]
         (build / "kraken_publish.inc").write_text("\n".join(marker_constants) + "\n" + patch_record + "\n" +
             functions(root, "src/sm_pkg.c", ["sm_pkg_source_matches"]) + "\n" +
             functions(root, "src/sm_kraken.c", [
                 "join_path", "cancelled", "publish_cache", "signature_reader",
+                "source_stat_matches",
                 "package_signature_prefix", "write_reader_signature", "write_source_signature",
                 "matches_source_signature", "package_unchanged", "open_cache_temp",
                 "finish_cache_temp", "write_cache_marker", "same_package_after_rename",
-                "cached_backport_fingerprint", "write_image_pointer", "rebind_cache",
+                "cached_backport_fingerprint", "make_launch_source_readable",
+                "write_image_pointer", "rebind_cache",
             ]), encoding="utf-8")
         (build / "scan_cycle.inc").write_text(
             functions(root, "src/sm_scanner.c", ["run_full_scan_cycle"]), encoding="utf-8")

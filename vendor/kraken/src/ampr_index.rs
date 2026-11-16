@@ -258,7 +258,8 @@ fn plan(path: &str, size: u64, blocks: &[Chunk], vol_size: u64, aux_size: u64, z
     Ok(Plan { chunks, flags: FILE_PACKED })
 }
 
-// Sparse spans that cross the file's 256 KiB grid need a loose file.
+/// Whether the manifest can describe the file's blocks on its 256 KiB grid.
+/// Files spanning shared short compressed blocks may need a loose copy.
 pub fn packable(size: u64, blocks: &[Chunk], pkg_size: u64) -> bool {
     let volume_size = pkg_size.next_multiple_of(PAGE).max(2 * PAGE);
     plan("", size, blocks, volume_size, 0, PAGE).is_ok()

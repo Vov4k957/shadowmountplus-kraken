@@ -195,6 +195,13 @@ source is retained for registered games across restarts. Existing PKG lines
 in `manual.lst` can be removed from the manual source list. Library scans list
 already registered Kraken games using their stored source.
 
+Kraken Mount v0.2.1 adds container-only save and trophy metadata, artwork,
+and support for packages with short compressed blocks shared by multiple
+files. The package and its containing directory gain missing read or directory
+access bits when the game launches. Existing caches stay usable. To rebuild the
+cache and refresh the staged metadata, select **U** on the base PKG for an
+unpatched game, or on the applied LIH package to rebuild with its update.
+
 For installed games, use the **Library** details to review updates and DLC and remove them individually. Deleting an installer `.pkg` file in **Installation** removes that file, **not** the already installed game. Conversely, uninstalling a game from **Library** does not automatically delete the original PKG installer.
 
 ### Backports: install, replace and remove
@@ -402,10 +409,10 @@ Run these commands from a clean checkout. An SMP update merges the source histor
 
 ```bash
 bash tools/sync-upstream.sh smp
-bash tools/sync-upstream.sh kraken v0.2.0
+bash tools/sync-upstream.sh kraken v0.2.1
 ```
 
-Replace `v0.2.0` with the Kraken release tag you want to test. The imported commit is recorded in `vendor/kraken/REVISION`. The PS5 build uses the vendored version so that a release rebuild selects the same reader and runtime.
+Replace `v0.2.1` with the Kraken release tag you want to test. The imported commit is recorded in `vendor/kraken/REVISION`. The PS5 build uses the vendored version so that a release rebuild selects the same reader and runtime.
 
 ## Credits
 

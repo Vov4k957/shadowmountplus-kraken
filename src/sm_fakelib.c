@@ -384,7 +384,7 @@ static bool mount_kraken_package(const char *title_id, const char *cache,
                                  const char *sandbox_app0) {
   char source[MAX_PATH], target[MAX_PATH], system_app0[MAX_PATH];
   struct statfs filesystem;
-  if (!sm_kraken_source_ready(cache) || !sm_kraken_source(cache, source))
+  if (!sm_kraken_launch_source(cache, source))
     return false;
   // The game may save into app0. The package's parent is mounted separately,
   // read-only, so the runtime can open the original file by its relative name.

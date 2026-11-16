@@ -190,7 +190,8 @@ static void test_kraken_rebind(const char *directory) {
   assert(join_path(directory, "original.pkg", original) && join_path(directory, "moved.pkg", moved));
   assert(join_path(cache, "kraken.image", image) && join_path(cache, KRAKEN_MARKER, marker));
   FILE *file = fopen(original, "wb");
-  assert(file && fputs("base package bytes", file) >= 0 && fclose(file) == 0);
+  assert(file && fchmod(fileno(file), 0600) == 0 &&
+         fputs("base package bytes", file) >= 0 && fclose(file) == 0);
   sm_pkg_info_t base = {.title_id = TITLE_A};
   snapshot_source(&base, original);
   char signature[280], updated[280];
@@ -224,6 +225,24 @@ static void test_kraken_rebind(const char *directory) {
   assert_file_contents(image, "kraken/moved.pkg");
   assert_file_contents(moved, "base package bytes");
   puts("Kraken relink: source identity, patch record and image pointer rollback passed");
+
+  assert(write_reader_signature(&base, KRAKEN_REVISION, KRAKEN_V020_READER, backport, signature));
+  assert(write_cache_marker(cache, moved, signature, &patch));
+  int fd = open(moved, O_RDONLY | O_NOFOLLOW);
+  assert(fd >= 0 && make_launch_source_readable(cache, moved, fd, signature, &patch));
+  struct stat st;
+  assert(fstat(fd, &st) == 0 && (st.st_mode & 0777) == 0644);
+  snapshot_source(&base, moved);
+  assert(write_reader_signature(&base, KRAKEN_REVISION, KRAKEN_V020_READER, backport, updated));
+  assert(source_stat_matches(updated, &st));
+  assert(make_launch_source_readable(cache, moved, fd, updated, &patch));
+  assert(close(fd) == 0);
+  count = snprintf(expected, sizeof(expected), "%s\n%s%s\n%s", moved, updated,
+                   patch.path, patch.signature);
+  assert(count > 0 && (size_t)count < sizeof(expected));
+  assert_file_contents(marker, expected);
+  assert_file_contents(moved, "base package bytes");
+  puts("Kraken launch: package read access, previous reader and LIH record preserved");
 }
 
 int main(int argc, char **argv) {

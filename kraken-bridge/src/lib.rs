@@ -209,17 +209,13 @@ impl PatchCache<'_> {
 fn prepare(io: &PackageIo, size: u64, mtime: i64, basename: &str) -> Result<(), BuildError> {
     let pkg = Pkg::open(io, size)?;
     prepare_package(io, io, &pkg, size, mtime, basename, |_, _| {}, |_, entry, _, _| {
-        let sparse = pkg.has_sparse(entry);
         let blocks = match pkg.blocks(entry) {
             Ok(blocks) => blocks,
-            Err(Error::Unsupported(_)) if sparse => return Ok(None),
+            Err(Error::Unsupported(_)) => return Ok(None),
             Err(error) => return Err(error.into()),
         };
         let chunks: Vec<_> = blocks.iter().map(|block| original_chunk(block, block.pkg_off)).collect();
-        if sparse && !ampr_index::packable(entry.size, &chunks, size) {
-            return Ok(None);
-        }
-        Ok(Some(chunks))
+        Ok(ampr_index::packable(entry.size, &chunks, size).then_some(chunks))
     })
 }
 

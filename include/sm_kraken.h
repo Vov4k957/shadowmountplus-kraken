@@ -21,6 +21,7 @@ typedef struct {
     void (*progress)(void *ctx, uint32_t phase, uint64_t done, uint64_t total);
     void *ctx;
     bool fast;
+    bool *rebuilt;
 } sm_kraken_job_t;
 // Reuse a matching cache or build a complete new cache before publishing it.
 // The caller must hold the scanner's external mutation guard.
@@ -34,6 +35,8 @@ bool sm_kraken_patch_source(const char *cache, char path[MAX_PATH]);
 bool sm_kraken_source(const char *cache, char path[MAX_PATH]);
 // Ejects and manual removals check the backing source without traversing the cache.
 bool sm_kraken_source_ready(const char *cache);
+// Resolve the verified source and grant the game read access before mounting it.
+bool sm_kraken_launch_source(const char *cache, char source[MAX_PATH]);
 // Refresh the bundled module in a compatible cache before mounting its fakelib.
 bool sm_kraken_refresh_runtime(const char *cache);
 // Report and recover a registered cache whose selected base path is stale.

@@ -4204,9 +4204,11 @@ static void run_kraken_job(uint64_t job_id, const char *title_id,
     error = "kraken_patch_invalid";
   }
   if (!status) {
+    bool rebuilt = false;
     sm_kraken_job_t job = {
       .cancelled = storage_job_cancelled, .finalize = begin_storage_job_finalizing,
       .progress = update_kraken_job, .ctx = ctx, .fast = action == KRAKEN_FAST_PATCH,
+      .rebuilt = &rebuilt,
     };
     bool ready = update ? sm_kraken_apply_patch(&base, &patch, &job)
                         : relink ? sm_kraken_relink_base(&base, &job, cache, action == KRAKEN_RELINK)
@@ -4223,11 +4225,12 @@ static void run_kraken_job(uint64_t job_id, const char *title_id,
         error = "kraken_title_conflict";
       else if (status == EINVAL)
         error = update ? "kraken_patch_invalid" : "kraken_base_invalid";
-    } else if (!update) {
+    } else {
+      const bool refresh_metadata = !relink || rebuilt;
       const char *name = base.title_name[0] ? base.title_name : title_id;
-      if (registered && has_appmeta_data(title_id))
+      if (registered && !refresh_metadata && has_appmeta_data(title_id))
         cache_game_entry(cache, title_id, name);
-      else if (!sm_install_mount_game(cache, title_id, name, registered)) {
+      else if (!sm_install_mount_game(cache, title_id, name, registered, refresh_metadata)) {
         status = errno ? errno : EIO;
         if (status != ECANCELED)
           error = "kraken_base_invalid";

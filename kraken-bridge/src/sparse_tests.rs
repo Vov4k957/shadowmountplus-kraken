@@ -348,6 +348,77 @@ fn make_patch(base: &[u8], target: &[u8]) -> TestRead {
 }
 
 #[test]
+fn container_metadata_is_staged_for_base_and_lih() {
+    let title = b"UP0001-PPSA54321_00-SYNTHETICPACKAGE";
+    let base = with_digests(synthetic_pkg(BLOCK), title);
+    let mut target = base.clone();
+    target[IMAGE..IMAGE + 18].copy_from_slice(b"russian audio data");
+    let mut target = with_digests(target, title);
+    let cnt = get64(&target, 0x58) as usize;
+    let entries = [
+        (0x100d_u32, "sce_sys/save_data.png", &b"save icon"[..]),
+        (0x1006, "sce_sys/pic1.png", &b"background"[..]),
+        (0x1480, "sce_sys/trophy2/trophy00.ucp", &b"trophies"[..]),
+        (0x1200, "sce_sys/icon0.png", &b"outer icon"[..]),
+    ];
+    target[cnt + 0x10..cnt + 0x14].copy_from_slice(&5_u32.to_be_bytes());
+    for (i, &(id, _, data)) in entries.iter().enumerate() {
+        let at = 0x900 + i * 32;
+        let row = cnt + 0x220 + i * 32;
+        target[row..row + 4].copy_from_slice(&id.to_be_bytes());
+        target[row + 16..row + 20].copy_from_slice(&(at as u32).to_be_bytes());
+        target[row + 20..row + 24].copy_from_slice(&(data.len() as u32).to_be_bytes());
+        target[cnt + at..cnt + at + data.len()].copy_from_slice(data);
+    }
+    let patch = make_patch(&base, &target);
+    for patched in [false, true] {
+        let mut io = TestIo {
+            pkg: if patched { base.clone() } else { target.clone() },
+            files: BTreeMap::new(),
+        };
+        let reader = PackageIo { context: ptr::from_mut(&mut io).cast(), read, write, loose_size };
+        if patched {
+            prepare_patched(&reader, &patch, base.len() as u64, patch.0.len() as u64,
+                            0, "base.pkg", &Verification::default(), |_, _, _| {}, || false)
+                .unwrap();
+        } else {
+            prepare(&reader, target.len() as u64, 0, "base.pkg").unwrap();
+        }
+        for &(_, path, data) in &entries[..3] {
+            assert_eq!(io.files[path], data);
+        }
+        assert_eq!(io.files["sce_sys/icon0.png"], b"icon");
+    }
+}
+
+#[test]
+fn short_compressed_block_is_extracted_when_it_cannot_be_indexed() {
+    let stored = lz_asset();
+    let mut pkg = synthetic_pkg_with_assets(BLOCK, &[], Some((&stored, 40, 4)));
+    let metadata = BLOCK + PAGE;
+    let end = metadata + 3 * PAGE;
+    let bounds = [
+        (0, 0x40), (BLOCK, 0), (BLOCK + 51, 0x40), (BLOCK + 128, 0),
+        (BLOCK + 256, 0), (BLOCK + 384, 0), (metadata, 0), (end, 0x40),
+    ];
+    let records = [
+        0,
+        kraken_record(BLOCK, stored.len(), stored.len()) | 2 << 32 | RUN_END,
+        128 << 48,
+        kraken_record(BLOCK + 128, 256, 128),
+        kraken_record(BLOCK + 256, 384, 128),
+        kraken_record(BLOCK + 384, PAGE, PAGE - 384),
+        kraken_record(metadata, BLOCK, 3 * PAGE) | RUN_END,
+        1 << 67, 0,
+    ];
+    set_layout(&mut pkg, end, &bounds, &records, 4);
+    let mut io = TestIo { pkg, files: BTreeMap::new() };
+    let reader = PackageIo { context: ptr::from_mut(&mut io).cast(), read, write, loose_size };
+    prepare(&reader, io.pkg.len() as u64, 0, "shared-block.pkg").unwrap();
+    assert_eq!(io.files["other.bin"], b"rusttest".repeat(5));
+}
+
+#[test]
 fn base_pkg_mounts_a_hole_that_wraps_the_block_window() {
     let size = BLOCK + PAGE;
     let raw = vec![0x37; 2 * PAGE];
