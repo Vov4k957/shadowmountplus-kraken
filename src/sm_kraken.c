@@ -20,17 +20,21 @@
 #define KRAKEN_REVISION "2"
 #define KRAKEN_INITIAL_READER "a20bb8be4578f4826e253e3e6f0ed94e1476683c"
 #define KRAKEN_V020_READER "73cc894b88338b617dfe8b173585e94db78cd348"
+#define KRAKEN_V021_READER "029386534988d7f70ba3eb2e01d4c285336e5611"
 #define KRAKEN_PATCH_REVISION "5"
 #define KRAKEN_PATCH_FAST_REVISION "5-fast"
 #define KRAKEN_PATCH_VOLUME ".smp-kraken-patch.pak"
 #define KRAKEN_ID ".smp-kraken-id"
 #define KRAKEN_AMPR "fakelib2/libSceAmpr.sprx"
+#define KRAKEN_PLAYGO "fakelib2/libScePlayGo.sprx"
 
 typedef unsigned char package_id_t[32];
 
 extern const unsigned char sm_kraken_runtime_start[];
 extern const unsigned char sm_kraken_runtime_end[];
 extern const char sm_kraken_revision[];
+extern const unsigned char sm_kraken_playgo_start[];
+extern const unsigned char sm_kraken_playgo_end[];
 
 typedef ssize_t (*package_read_fn)(void *, uint64_t, unsigned char *, size_t);
 typedef int (*package_write_fn)(void *, const unsigned char *, size_t, uint64_t,
@@ -251,7 +255,9 @@ static const char *signature_reader(const char *signature, const char *format) {
   if (strncmp(signature, format, prefix) || signature[prefix] != ' ')
     return NULL;
   const char *reader = signature + prefix + 1;
-  const char *readers[] = {sm_kraken_revision, KRAKEN_V020_READER, KRAKEN_INITIAL_READER};
+  const char *readers[] = {
+    sm_kraken_revision, KRAKEN_V021_READER, KRAKEN_V020_READER, KRAKEN_INITIAL_READER,
+  };
   for (size_t i = 0; i < sizeof(readers) / sizeof(readers[0]); i++) {
     size_t length = strlen(readers[i]);
     if (!strncmp(reader, readers[i], length) && reader[length] == ' ')
@@ -417,6 +423,63 @@ static int stage_write(void *context, const unsigned char *name, size_t length,
     count -= (size_t)written;
   }
   return 0;
+}
+
+static bool eboot_mentions_playgo(const char *path, const cache_io_t *io) {
+  const char module[] = "libScePlayGo";
+  const size_t length = sizeof(module) - 1u;
+  const size_t block = 64u * 1024u;
+  int fd = open(path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW);
+  if (fd < 0)
+    return false;
+  char *buffer = malloc(block + length - 1u);
+  bool found = false;
+  size_t carry = 0;
+  while (buffer && !found && !cache_cancelled(io)) {
+    ssize_t bytes = read(fd, buffer + carry, block);
+    if (bytes < 0 && errno == EINTR)
+      continue;
+    if (bytes <= 0)
+      break;
+    size_t total = carry + (size_t)bytes;
+    for (size_t i = 0; i + length <= total; i++) {
+      if (buffer[i] == module[0] && memcmp(buffer + i, module, length) == 0) {
+        found = true;
+        break;
+      }
+    }
+    carry = total < length ? total : length - 1u;
+    memmove(buffer, buffer + total - carry, carry);
+  }
+  free(buffer);
+  close(fd);
+  return found;
+}
+
+static bool stage_playgo(cache_io_t *io) {
+  char executable[MAX_PATH];
+  // Search the staged directory after the game and backport have supplied
+  // their own modules. Keep any existing PlayGo implementation.
+  if (resolve_sce_sys_file(io->staging, KRAKEN_PLAYGO, executable) ||
+      errno != ENOENT)
+    return true;
+  if (!join_path(io->staging, "eboot.bin", executable))
+    return false;
+  if (!eboot_mentions_playgo(executable, io)) {
+    if (!cache_cancelled(io))
+      return true;
+    errno = ECANCELED;
+    return false;
+  }
+
+  const char output[] = KRAKEN_PLAYGO;
+  int status = stage_write(io, (const unsigned char *)output, sizeof(output) - 1u,
+      0, sm_kraken_playgo_start, (size_t)(sm_kraken_playgo_end - sm_kraken_playgo_start));
+  if (status) {
+    errno = status;
+    return false;
+  }
+  return true;
 }
 
 static int staged_file_size(void *context, const unsigned char *name,
@@ -1037,6 +1100,8 @@ static bool prepare_cache(const sm_pkg_info_t *info, const sm_pkg_info_t *patch,
     ready = status == 0;
     if (!ready) errno = status;
   }
+  if (ready)
+    ready = stage_playgo(&io);
   int error = ready ? 0 : (errno ? errno : EIO);
   if (close_output(&io) != 0 && error == 0)
     error = errno;

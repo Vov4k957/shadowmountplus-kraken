@@ -248,6 +248,52 @@ unsafe extern "C" fn loose_size(_: *mut c_void, _: *const u8, _: usize, _: *mut 
 }
 
 #[test]
+fn package_stages_emulator_settings_and_excludes_only_the_legacy_save_module() {
+    for fakelib in ["fakelib", "fakelib2"] {
+        let mut pkg = synthetic_pkg(BLOCK);
+        let image = &mut pkg[IMAGE..];
+        let start = 3 * PAGE;
+        let mut end = dirent(image, start, 5, 2, "zero.bin");
+        end = dirent(image, end, 6, 2, "other.bin");
+        end = dirent(image, end, 7, 2, "eboot.bin");
+        end = dirent(image, end, 3, 3, "sce_sys");
+        end = dirent(image, end, 10, 3, fakelib);
+        end = dirent(image, end, 12, 2, "dlc_emu.ini");
+        end = dirent(image, end, 13, 2, "playgo_stub.dat");
+        let metadata = BLOCK + PAGE;
+        inner_inode(image, 4, 0x4000, metadata + 2 * PAGE, end - start);
+        let start = end;
+        end = dirent(image, end, 8, 2, "param.json");
+        end = dirent(image, end, 9, 2, "icon0.png");
+        inner_inode(image, 3, 0x4000, metadata + start - PAGE, end - start);
+        let start = end;
+        end = dirent(image, end, 11, 2, "libSceSaveData.native.sprx");
+        inner_inode(image, 10, 0x4000, metadata + start - PAGE, end - start);
+
+        let files = [
+            (11, &b"game save library"[..]),
+            (12, &b"dlc settings"[..]),
+            (13, &b"playgo settings"[..]),
+        ];
+        for (i, (inode, bytes)) in files.into_iter().enumerate() {
+            let offset = 512 + i * 128;
+            image[offset..offset + bytes.len()].copy_from_slice(bytes);
+            inner_inode(image, inode, 0x8000, BLOCK + offset, bytes.len());
+        }
+        put64(image, PAGE + 0x30, 14);
+
+        let mut io = TestIo { pkg, files: BTreeMap::new() };
+        let reader = PackageIo { context: ptr::from_mut(&mut io).cast(), read, write, loose_size };
+        prepare(&reader, io.pkg.len() as u64, 0, "game.pkg").unwrap();
+        assert_eq!(io.files["dlc_emu.ini"], b"dlc settings");
+        assert_eq!(io.files["playgo_stub.dat"], b"playgo settings");
+        let module = io.files.get("fakelib2/libSceSaveData.native.sprx").map(Vec::as_slice);
+        let expected = (fakelib == "fakelib2").then_some(&b"game save library"[..]);
+        assert_eq!(module, expected);
+    }
+}
+
+#[test]
 fn sparse_pkg_uses_a_shared_zero_volume() {
     for zero_len in [BLOCK * 2, BLOCK + PAGE / 2] {
         let mut io = TestIo { pkg: synthetic_pkg(zero_len), files: BTreeMap::new() };

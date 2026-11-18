@@ -202,6 +202,15 @@ access bits when the game launches. Existing caches stay usable. To rebuild the
 cache and refresh the staged metadata, select **U** on the base PKG for an
 unpatched game, or on the applied LIH package to rebuild with its update.
 
+The Kraken Mount v0.3.0 integration leaves the system save module in place
+when a PKG supplies `libSceSaveData.native.sprx` in its legacy `fakelib/`.
+An explicit `fakelib2/` or backport can still supply its own module.
+Rebuild an existing game's cache once with **U** to apply the save fix.
+Files named `dlc_emu.ini` and `playgo_stub.dat` at the package root are staged
+as separate files so that game and backport modules can read them.
+For a PKG game whose staged executable references PlayGo, SMP supplies
+drakmor's `pgo_stub` 0.6 when the game or backport supplies no PlayGo module.
+
 For installed games, use the **Library** details to review updates and DLC and remove them individually. Deleting an installer `.pkg` file in **Installation** removes that file, **not** the already installed game. Conversely, uninstalling a game from **Library** does not automatically delete the original PKG installer.
 
 ### Backports: install, replace and remove
@@ -409,10 +418,10 @@ Run these commands from a clean checkout. An SMP update merges the source histor
 
 ```bash
 bash tools/sync-upstream.sh smp
-bash tools/sync-upstream.sh kraken v0.2.1
+bash tools/sync-upstream.sh kraken v0.3.0
 ```
 
-Replace `v0.2.1` with the Kraken release tag you want to test. The imported commit is recorded in `vendor/kraken/REVISION`. The PS5 build uses the vendored version so that a release rebuild selects the same reader and runtime.
+Replace `v0.3.0` with the Kraken release tag you want to test. The imported commit is recorded in `vendor/kraken/REVISION`. The PS5 build uses the vendored version so that a release rebuild selects the same reader and runtime.
 
 ## Credits
 

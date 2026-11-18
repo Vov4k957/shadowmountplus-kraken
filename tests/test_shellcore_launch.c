@@ -226,14 +226,14 @@ static void test_kraken_rebind(const char *directory) {
   assert_file_contents(moved, "base package bytes");
   puts("Kraken relink: source identity, patch record and image pointer rollback passed");
 
-  assert(write_reader_signature(&base, KRAKEN_REVISION, KRAKEN_V020_READER, backport, signature));
+  assert(write_reader_signature(&base, KRAKEN_REVISION, KRAKEN_V021_READER, backport, signature));
   assert(write_cache_marker(cache, moved, signature, &patch));
   int fd = open(moved, O_RDONLY | O_NOFOLLOW);
   assert(fd >= 0 && make_launch_source_readable(cache, moved, fd, signature, &patch));
   struct stat st;
   assert(fstat(fd, &st) == 0 && (st.st_mode & 0777) == 0644);
   snapshot_source(&base, moved);
-  assert(write_reader_signature(&base, KRAKEN_REVISION, KRAKEN_V020_READER, backport, updated));
+  assert(write_reader_signature(&base, KRAKEN_REVISION, KRAKEN_V021_READER, backport, updated));
   assert(source_stat_matches(updated, &st));
   assert(make_launch_source_readable(cache, moved, fd, updated, &patch));
   assert(close(fd) == 0);

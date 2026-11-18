@@ -36,7 +36,7 @@ def main():
         (build / "launch_helpers.inc").write_text(
             functions(root, "src/sm_shellcore_service.c", names), encoding="utf-8")
         kraken = (root / "src/sm_kraken.c").read_text(encoding="utf-8")
-        marker_constants = re.findall(r"^#define KRAKEN_(?:MARKER|REVISION|INITIAL_READER|V020_READER) .*$", kraken, re.M)
+        marker_constants = re.findall(r"^#define KRAKEN_(?:MARKER|REVISION|INITIAL_READER|V\d+_READER) .*$", kraken, re.M)
         patch_record = re.search(r"typedef struct \{[^}]+\} patch_record_t;", kraken)[0]
         (build / "kraken_publish.inc").write_text("\n".join(marker_constants) + "\n" + patch_record + "\n" +
             functions(root, "src/sm_pkg.c", ["sm_pkg_source_matches"]) + "\n" +

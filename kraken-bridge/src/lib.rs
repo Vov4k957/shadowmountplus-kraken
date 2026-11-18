@@ -306,6 +306,11 @@ fn prepare_package(
         ampr_index::check_path(entry.path)?;
         let lower = entry.path.to_ascii_lowercase();
         if let Some(name) = lower.strip_prefix(primary_lib) {
+            // Only the game's legacy fakelib can shadow the system save
+            // module unintentionally. Keep explicit fakelib2 and backports.
+            if primary_lib == "fakelib/" && name == "libscesavedata.native.sprx" {
+                continue;
+            }
             if !name.contains('/') && !matches!(name, "libkernel.sprx" | "libsceampr.sprx") {
                 let name = &entry.path[primary_lib.len()..];
                 let out = format!("fakelib2/{name}");
@@ -328,7 +333,8 @@ fn prepare_package(
             return Err(format!("case-insensitive duplicate {}", entry.path).into());
         }
         let loose = io.override_size(entry.path)?;
-        let extract = lower.starts_with("sce_sys/") || matches!(lower.as_str(), "eboot.bin" | "eboot2.bin") ||
+        let extract = lower.starts_with("sce_sys/") ||
+            matches!(lower.as_str(), "eboot.bin" | "eboot2.bin" | "dlc_emu.ini" | "playgo_stub.dat") ||
             lower.ends_with(".prx") || lower.ends_with(".sprx");
         let (length, chunks) = if let Some(length) = loose {
             (length, None)

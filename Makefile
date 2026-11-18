@@ -41,6 +41,7 @@ KRAKEN_TARGET := x86_64-unknown-freebsd
 KRAKEN_LIB := kraken-bridge/target/$(KRAKEN_TARGET)/release/libsmp_kraken_bridge.a
 KRAKEN_VENDOR := vendor/kraken
 KRAKEN_AMPR := $(KRAKEN_VENDOR)/vendor/ampr-emu-ng
+KRAKEN_PLAYGO := vendor/pgo_stub
 KRAKEN_SOURCES := $(shell find kraken-bridge/src $(KRAKEN_VENDOR)/crates/kraken-mount-pkg/src -name '*.rs')
 
 # Targets
@@ -67,8 +68,9 @@ shadowmountplus.elf: $(OBJS) $(KERNEL_SYS_STUB_SO) $(JSON_C_LIB) $(KRAKEN_LIB) s
 $(KRAKEN_LIB): $(KRAKEN_SOURCES) kraken-bridge/Cargo.toml kraken-bridge/Cargo.lock $(KRAKEN_VENDOR)/src/ampr_index.rs $(KRAKEN_VENDOR)/crates/kraken-mount-pkg/Cargo.toml
 	$(CARGO) build --release --locked --target $(KRAKEN_TARGET) --manifest-path kraken-bridge/Cargo.toml
 
-src/kraken_assets.o: src/kraken_assets.S $(KRAKEN_AMPR)/libSceAmpr.sprx $(KRAKEN_AMPR)/SHA256SUMS $(KRAKEN_VENDOR)/REVISION
+src/kraken_assets.o: src/kraken_assets.S $(KRAKEN_AMPR)/libSceAmpr.sprx $(KRAKEN_AMPR)/SHA256SUMS $(KRAKEN_VENDOR)/REVISION $(KRAKEN_PLAYGO)/libScePlayGo.sprx $(KRAKEN_PLAYGO)/SHA256SUMS
 	cd $(KRAKEN_AMPR) && sha256sum --check --ignore-missing --strict SHA256SUMS
+	cd $(KRAKEN_PLAYGO) && sha256sum --check --strict SHA256SUMS
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 $(KERNEL_SYS_STUB_SO): $(KERNEL_SYS_STUB_SRCS)

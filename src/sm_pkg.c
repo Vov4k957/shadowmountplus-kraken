@@ -388,7 +388,8 @@ static bool parse_param_json(const uint8_t *data, size_t size,
                   json_object_get_string(value));
     struct json_object *localized = NULL;
     if (json_object_object_get_ex(root, "localizedParameters", &localized) &&
-        json_object_is_type(localized, json_type_object)) {
+        json_object_is_type(localized, json_type_object) &&
+        !sm_gameinfo_console_title(localized, candidate->title_name)) {
       struct json_object *language = NULL;
       const char *preferred = NULL;
       if (json_object_object_get_ex(localized, "defaultLanguage", &language) &&
