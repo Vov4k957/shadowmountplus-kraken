@@ -410,7 +410,7 @@ paths:
           $ref: "#/components/responses/Preflight"
     post:
       operationId: setGameFakelib
-      summary: Set the fakelib mode or global overlay exclusion for a PS5 game on its next launch
+      summary: Set a PS5 game's fakelib, global overlay or bundled PlayGo policy for its next launch
       tags: [Games]
       requestBody:
         required: true
@@ -424,12 +424,21 @@ paths:
                     - required: [mode]
                     - required: [enabled]
                   not:
-                    required: [ignore_global_fakelib]
+                    anyOf:
+                      - required: [ignore_global_fakelib]
+                      - required: [playgo_stub_enabled]
                 - required: [ignore_global_fakelib]
                   not:
                     anyOf:
                       - required: [mode]
                       - required: [enabled]
+                      - required: [playgo_stub_enabled]
+                - required: [playgo_stub_enabled]
+                  not:
+                    anyOf:
+                      - required: [mode]
+                      - required: [enabled]
+                      - required: [ignore_global_fakelib]
               properties:
                 title_id:
                   $ref: "#/components/schemas/TitleId"
@@ -444,6 +453,9 @@ paths:
                 ignore_global_fakelib:
                   type: boolean
                   description: Update only the global overlay exclusion. False removes it. Cannot be combined with mode or enabled.
+                playgo_stub_enabled:
+                  type: boolean
+                  description: Enable or disable the bundled PlayGo stub for a Kraken-mounted PKG. Submit on its own.
       responses:
         "200":
           description: Per-title policy saved; existing mounts are preserved
@@ -458,6 +470,9 @@ paths:
                     const: 0
                   title_id:
                     $ref: "#/components/schemas/TitleId"
+                  playgo_stub_enabled:
+                    type: boolean
+                    description: Effective bundled stub setting when it was updated.
                   fakelib_mode:
                     type: string
                     enum: [full, emulators, disabled]
@@ -2306,6 +2321,9 @@ components:
         kraken_patch_applied:
           type: boolean
           description: The registered title uses a Kraken cache with an applied LIH update.
+        playgo_stub_enabled:
+          type: boolean
+          description: Bundled PlayGo stub policy for a Kraken-mounted PKG that can use it or has saved an opt-out. Game details only.
         can_toggle_fakelib:
           type: boolean
           description: True for PS5 games in PKGs, images and folders.

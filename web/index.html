@@ -1352,6 +1352,7 @@
           fakelibMode: "Fakelib mounting",
           changeFakelibMode: "Select to cycle modes",
           ignoreGlobalFakelib: "Ignore global fakelib",
+          usePlaygoStub: "Use bundled PlayGo stub",
           fakelibDefaultMode: "Default fakelib mode",
           fakelibDefault: "Default ({mode})",
           fakelibFull: "Full",
@@ -1684,6 +1685,7 @@
           fakelibMode: "Монтирование fakelib",
           changeFakelibMode: "Нажмите для смены режима",
           ignoreGlobalFakelib: "Игнорировать глобальный fakelib",
+          usePlaygoStub: "Использовать встроенную заглушку PlayGo",
           fakelibDefaultMode: "Режим fakelib по умолчанию",
           fakelibDefault: "По умолчанию ({mode})",
           fakelibFull: "Полное",
@@ -4447,6 +4449,17 @@
           }
           sidebar.append(policy);
         }
+        if (typeof game.playgo_stub_enabled === "boolean") {
+          const policy = node("section", "fakelib-controls");
+          const playgo = actionButton("", () =>
+            setGameFakelib(game, playgo, { playgo_stub_enabled: !game.playgo_stub_enabled }), "fakelib-switch");
+          playgo.setAttribute("role", "switch");
+          playgo.setAttribute("aria-checked", String(game.playgo_stub_enabled));
+          playgo.disabled = Boolean(state.fakelibSaving);
+          playgo.append(node("span", "switch-label", t("usePlaygoStub")), node("span", "switch-track"));
+          policy.append(playgo, node("p", "subtle fakelib-hint", t("fakelibNextLaunch")));
+          sidebar.append(policy);
+        }
         details.append(content);
 
         const actions = $("modalActions");
@@ -4816,6 +4829,9 @@
             fakelib_effective_enabled: result.fakelib_effective_enabled,
             ignore_global_fakelib: result.ignore_global_fakelib
           };
+          if (typeof result.playgo_stub_enabled === "boolean") {
+            policy.playgo_stub_enabled = result.playgo_stub_enabled;
+          }
           Object.assign(game, policy);
           for (const listed of state.games) {
             if (listed.title_id === game.title_id) Object.assign(listed, policy);

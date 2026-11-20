@@ -25,8 +25,11 @@
 #define KRAKEN_PATCH_FAST_REVISION "5-fast"
 #define KRAKEN_PATCH_VOLUME ".smp-kraken-patch.pak"
 #define KRAKEN_ID ".smp-kraken-id"
-#define KRAKEN_AMPR "fakelib2/libSceAmpr.sprx"
+#define KRAKEN_AMPR_NAME "libSceAmpr.sprx"
+#define KRAKEN_AMPR "fakelib2/" KRAKEN_AMPR_NAME
+#define KRAKEN_AMPR_MAX_SIZE (16u * 1024u * 1024u)
 #define KRAKEN_PLAYGO "fakelib2/libScePlayGo.sprx"
+#define KRAKEN_PLAYGO_STATE ".smp-kraken-playgo"
 
 typedef unsigned char package_id_t[32];
 
@@ -425,6 +428,15 @@ static int stage_write(void *context, const unsigned char *name, size_t length,
   return 0;
 }
 
+static bool buffer_contains(const unsigned char *data, size_t size,
+                            const char *needle, size_t length) {
+  for (size_t i = 0; i + length <= size; i++) {
+    if (data[i] == (unsigned char)needle[0] && memcmp(data + i, needle, length) == 0)
+      return true;
+  }
+  return false;
+}
+
 static bool eboot_mentions_playgo(const char *path, const cache_io_t *io) {
   const char module[] = "libScePlayGo";
   const size_t length = sizeof(module) - 1u;
@@ -432,7 +444,7 @@ static bool eboot_mentions_playgo(const char *path, const cache_io_t *io) {
   int fd = open(path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW);
   if (fd < 0)
     return false;
-  char *buffer = malloc(block + length - 1u);
+  unsigned char *buffer = malloc(block + length - 1u);
   bool found = false;
   size_t carry = 0;
   while (buffer && !found && !cache_cancelled(io)) {
@@ -442,12 +454,7 @@ static bool eboot_mentions_playgo(const char *path, const cache_io_t *io) {
     if (bytes <= 0)
       break;
     size_t total = carry + (size_t)bytes;
-    for (size_t i = 0; i + length <= total; i++) {
-      if (buffer[i] == module[0] && memcmp(buffer + i, module, length) == 0) {
-        found = true;
-        break;
-      }
-    }
+    found = buffer_contains(buffer, total, module, length);
     carry = total < length ? total : length - 1u;
     memmove(buffer, buffer + total - carry, carry);
   }
@@ -458,23 +465,26 @@ static bool eboot_mentions_playgo(const char *path, const cache_io_t *io) {
 
 static bool stage_playgo(cache_io_t *io) {
   char executable[MAX_PATH];
-  // Search the staged directory after the game and backport have supplied
-  // their own modules. Keep any existing PlayGo implementation.
-  if (resolve_sce_sys_file(io->staging, KRAKEN_PLAYGO, executable) ||
-      errno != ENOENT)
-    return true;
-  if (!join_path(io->staging, "eboot.bin", executable))
-    return false;
-  if (!eboot_mentions_playgo(executable, io)) {
-    if (!cache_cancelled(io))
-      return true;
-    errno = ECANCELED;
-    return false;
+  unsigned char state = '0';
+  if (!resolve_sce_sys_file(io->staging, KRAKEN_PLAYGO, executable) &&
+      errno == ENOENT) {
+    if (!join_path(io->staging, "eboot.bin", executable))
+      return false;
+    if (eboot_mentions_playgo(executable, io))
+      state = '1';
   }
 
   const char output[] = KRAKEN_PLAYGO;
-  int status = stage_write(io, (const unsigned char *)output, sizeof(output) - 1u,
-      0, sm_kraken_playgo_start, (size_t)(sm_kraken_playgo_end - sm_kraken_playgo_start));
+  int status = 0;
+  if (state == '1') {
+    status = stage_write(io, (const unsigned char *)output, sizeof(output) - 1u,
+        0, sm_kraken_playgo_start, (size_t)(sm_kraken_playgo_end - sm_kraken_playgo_start));
+  }
+  if (status == 0) {
+    const char marker[] = KRAKEN_PLAYGO_STATE;
+    status = stage_write(io, (const unsigned char *)marker, sizeof(marker) - 1u,
+                         0, &state, 1);
+  }
   if (status) {
     errno = status;
     return false;
@@ -825,32 +835,171 @@ static bool finish_cache_temp(FILE *file, const char *temporary, const char *tar
   return error == 0;
 }
 
-static bool refresh_runtime_file(const char *cache) {
-  char path[MAX_PATH], temporary[MAX_PATH];
-  if (!join_path(cache, KRAKEN_AMPR, path))
-    return false;
-  size_t size = (size_t)(sm_kraken_runtime_end - sm_kraken_runtime_start);
+static bool cached_module_matches(const char *path, const unsigned char *data,
+                                  size_t size) {
   int fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
-  if (fd >= 0) {
-    struct stat st;
-    bool current = fstat(fd, &st) == 0 && S_ISREG(st.st_mode) &&
-        st.st_size == (off_t)size && (st.st_mode & 0111) != 0;
-    unsigned char block[4096];
-    for (size_t offset = 0; current && offset < size; offset += sizeof(block)) {
-      size_t count = size - offset < sizeof(block) ? size - offset : sizeof(block);
-      current = pread(fd, block, count, (off_t)offset) == (ssize_t)count &&
-          memcmp(block, sm_kraken_runtime_start + offset, count) == 0;
-    }
-    close(fd);
-    if (current)
-      return true;
+  if (fd < 0)
+    return false;
+  struct stat st;
+  bool current = fstat(fd, &st) == 0 && S_ISREG(st.st_mode) &&
+      st.st_size == (off_t)size;
+  unsigned char block[4096];
+  for (size_t offset = 0; current && offset < size; offset += sizeof(block)) {
+    size_t count = size - offset < sizeof(block) ? size - offset : sizeof(block);
+    ssize_t length;
+    do {
+      length = pread(fd, block, count, (off_t)offset);
+    } while (length < 0 && errno == EINTR);
+    current = length == (ssize_t)count && memcmp(block, data + offset, count) == 0;
   }
+  close(fd);
+  return current;
+}
+
+static bool write_cache_asset(const char *path, const void *data, size_t size,
+                              mode_t mode) {
+  char temporary[MAX_PATH];
   FILE *file = open_cache_temp(path, temporary);
   if (!file)
     return false;
-  bool written = fchmod(fileno(file), 0777) == 0 &&
-      fwrite(sm_kraken_runtime_start, 1, size, file) == size;
+  bool written = fchmod(fileno(file), mode) == 0 && fwrite(data, 1, size, file) == size;
   return finish_cache_temp(file, temporary, path, written);
+}
+
+static unsigned char *read_shared_ampr(const char *path, size_t *size) {
+  int fd = open(path, O_RDONLY | O_NONBLOCK);
+  if (fd < 0)
+    return NULL;
+  struct stat before, after;
+  int error = 0;
+  unsigned char *data = NULL;
+  size_t length = 0;
+  if (fstat(fd, &before) != 0)
+    error = errno;
+  else if (!S_ISREG(before.st_mode) || before.st_size < 64 ||
+           before.st_size > KRAKEN_AMPR_MAX_SIZE)
+    error = ENOEXEC;
+  else {
+    length = (size_t)before.st_size;
+    data = malloc(length);
+    if (!data)
+      error = ENOMEM;
+  }
+  for (size_t offset = 0; error == 0 && offset < length;) {
+    ssize_t count = pread(fd, data + offset, length - offset, (off_t)offset);
+    if (count < 0 && errno == EINTR)
+      continue;
+    if (count <= 0)
+      error = count < 0 ? errno : EIO;
+    else
+      offset += (size_t)count;
+  }
+  if (error == 0 && fstat(fd, &after) != 0)
+    error = errno;
+  if (error == 0 && (before.st_size != after.st_size ||
+      before.st_mtim.tv_sec != after.st_mtim.tv_sec ||
+      before.st_mtim.tv_nsec != after.st_mtim.tv_nsec ||
+      before.st_ctim.tv_sec != after.st_ctim.tv_sec ||
+      before.st_ctim.tv_nsec != after.st_ctim.tv_nsec))
+    error = EAGAIN;
+  close(fd);
+
+  // Debug PKG needs AMPR-emu-NG's package reader. The legacy AMPR library
+  // may also be present in this directory for the other mount formats.
+  static const char pkg_path[] = "/app0/kraken";
+  if (error == 0) {
+    bool elf = memcmp(data, "\177ELF\2\1", 6) == 0;
+    uint64_t self_size = read_le64(data + 16);
+    bool self = memcmp(data, "\117\025\075\035", 4) == 0 &&
+                self_size >= 64 && self_size <= length;
+    if ((!elf && !self) || !buffer_contains(data, length, pkg_path, sizeof(pkg_path) - 1u))
+      error = ENOEXEC;
+  }
+  if (error) {
+    free(data);
+    errno = error;
+    return NULL;
+  }
+  *size = length;
+  return data;
+}
+
+static bool refresh_runtime_file(const char *cache, const char *emulators_path) {
+  char path[MAX_PATH], shared_path[MAX_PATH];
+  if (!join_path(cache, KRAKEN_AMPR, path))
+    return false;
+  unsigned char *shared = NULL;
+  size_t size = (size_t)(sm_kraken_runtime_end - sm_kraken_runtime_start);
+  if (emulators_path && *emulators_path) {
+    if (join_path(emulators_path, KRAKEN_AMPR_NAME, shared_path))
+      shared = read_shared_ampr(shared_path, &size);
+    if (!shared && errno != ENOENT)
+      log_debug("  [KRAKEN] shared AMPR unavailable in %s: %s", emulators_path, strerror(errno));
+  }
+  const unsigned char *data = shared ? shared : sm_kraken_runtime_start;
+  struct stat st;
+  bool current = lstat(path, &st) == 0 && (st.st_mode & 0111) != 0 &&
+                 cached_module_matches(path, data, size);
+  bool ready = current || write_cache_asset(path, data, size, 0777);
+  if (ready && !current)
+    log_debug("  [KRAKEN] AMPR for %s: %s", cache, shared ? shared_path : "bundled");
+  free(shared);
+  return ready;
+}
+
+static char read_playgo_state(const char *path) {
+  char state = '\0';
+  int fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+  if (fd < 0)
+    return '\0';
+  struct stat st;
+  if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size == 1) {
+    ssize_t length;
+    do {
+      length = read(fd, &state, 1);
+    } while (length < 0 && errno == EINTR);
+    if (length != 1)
+      state = '\0';
+  }
+  close(fd);
+  return state;
+}
+
+bool sm_kraken_has_bundled_playgo(const char *cache) {
+  char path[MAX_PATH];
+  if (!join_path(cache, KRAKEN_PLAYGO_STATE, path))
+    return false;
+  char state = read_playgo_state(path);
+  if (state == '0' || state == '1')
+    return state == '1';
+  return join_path(cache, KRAKEN_PLAYGO, path) &&
+      cached_module_matches(path, sm_kraken_playgo_start,
+                            (size_t)(sm_kraken_playgo_end - sm_kraken_playgo_start));
+}
+
+static bool refresh_playgo(const char *cache, bool enabled) {
+  char marker[MAX_PATH], path[MAX_PATH];
+  if (!join_path(cache, KRAKEN_PLAYGO_STATE, marker) ||
+      !join_path(cache, KRAKEN_PLAYGO, path))
+    return false;
+  char state = read_playgo_state(marker);
+  if (state == '0' || (state != '1' && enabled))
+    return true;
+
+  const size_t size = (size_t)(sm_kraken_playgo_end - sm_kraken_playgo_start);
+  if (enabled) {
+    char existing[MAX_PATH];
+    if (resolve_sce_sys_file(cache, KRAKEN_PLAYGO, existing))
+      return true;
+    return errno == ENOENT && write_cache_asset(path, sm_kraken_playgo_start, size, 0777);
+  }
+  if (!cached_module_matches(path, sm_kraken_playgo_start, size))
+    return true;
+  // Older caches have no origin marker. The exact bundled stub can be
+  // restored from the ELF, so record it before applying the opt-out.
+  if (state != '1' && !write_cache_asset(marker, "1", 1, 0600))
+    return false;
+  return unlink(path) == 0 || errno == ENOENT;
 }
 
 static bool read_package_id(const char *cache, package_id_t id) {
@@ -889,13 +1038,16 @@ static bool capture_package_id(const sm_pkg_info_t *base, const sm_kraken_job_t 
   return ready;
 }
 
-bool sm_kraken_refresh_runtime(const char *cache) {
+bool sm_kraken_refresh_runtime(const char *cache, const char *emulators_path,
+                               bool playgo_stub_enabled) {
   if (!sm_kraken_is_cache(cache)) {
     errno = EINVAL;
     return false;
   }
-  if (!refresh_runtime_file(cache))
+  if (!refresh_runtime_file(cache, emulators_path))
     return false;
+  if (!refresh_playgo(cache, playgo_stub_enabled))
+    log_debug("  [KRAKEN] PlayGo policy for %s: %s", cache, strerror(errno));
 
   // Old caches already contain the files and index needed for launch. Record
   // the portable PKG ID once while that cache still has its verified source.

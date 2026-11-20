@@ -1375,6 +1375,7 @@ static struct json_object *game_to_json(
   const char *install_time = metadata ? metadata->install_time : "";
   const char *platform = game_platform_name(source->title_id, metadata);
   bool can_toggle_fakelib = strcmp(platform, "ps5") == 0 && !source_info.kraken;
+  bool playgo_stub_disabled = sm_config_title_playgo_stub_disabled(cfg, source->title_id);
   sm_fakelib_mode_t fakelib_mode =
       sm_config_title_fakelib_mode(cfg, source->title_id);
   bool fakelib_enabled = fakelib_mode != SM_FAKELIB_DISABLED;
@@ -1410,6 +1411,9 @@ static struct json_object *game_to_json(
   if (!add_json_bool(item, "installed_pkg", installed_pkg) ||
       !add_json_bool(item, "can_uninstall", installed) ||
       !add_json_bool(item, "kraken_patch_applied", lih_applied) ||
+      (!library_entry && source_info.kraken &&
+       (playgo_stub_disabled || sm_kraken_has_bundled_playgo(source->path)) &&
+       !add_json_bool(item, "playgo_stub_enabled", !playgo_stub_disabled)) ||
       !add_json_bool(item, "can_manage_source", !installed_pkg && !source_info.kraken) ||
       !add_json_bool(item, "can_toggle_fakelib", can_toggle_fakelib) ||
       !add_json_bool(item, "ignore_global_fakelib",
@@ -3086,11 +3090,20 @@ static void handle_game_fakelib(struct MHD_Connection *connection,
   sm_fakelib_mode_t mode = SM_FAKELIB_DEFAULT;
   struct json_object *mode_value = NULL;
   struct json_object *global_value = NULL;
+  struct json_object *playgo_value = NULL;
   bool update_global = json_object_object_get_ex(request, "ignore_global_fakelib",
                                                  &global_value);
+  bool update_playgo = json_object_object_get_ex(request, "playgo_stub_enabled",
+                                                 &playgo_value);
   bool global_excluded = false;
+  bool playgo_enabled = false;
   bool valid_policy;
-  if (update_global) {
+  if (update_playgo) {
+    valid_policy = json_object_is_type(playgo_value, json_type_boolean) && !update_global &&
+                   !json_object_object_get_ex(request, "mode", &mode_value) &&
+                   !json_object_object_get_ex(request, "enabled", &mode_value);
+    playgo_enabled = json_object_get_boolean(playgo_value);
+  } else if (update_global) {
     valid_policy = json_object_is_type(global_value, json_type_boolean) &&
                    !json_object_object_get_ex(request, "mode", &mode_value) &&
                    !json_object_object_get_ex(request, "enabled", &mode_value);
@@ -3106,8 +3119,8 @@ static void handle_game_fakelib(struct MHD_Connection *connection,
   }
   if (!title_id || !valid_policy) {
     send_error_response(connection, 400, EINVAL,
-                        "title_id and a valid fakelib setting are required; "
-                        "ignore_global_fakelib cannot be combined with mode or enabled");
+                        "title_id and a valid fakelib setting are required. "
+                        "Send PlayGo or global overlay changes on their own");
     return;
   }
   if (strncmp(title_id, "PPSA", 4u) != 0) {
@@ -3137,9 +3150,18 @@ static void handle_game_fakelib(struct MHD_Connection *connection,
                         strerror(status));
     return;
   }
-  bool saved = update_global
-                   ? sm_config_set_title_global_fakelib_excluded(title_id, global_excluded)
-                   : sm_config_set_title_fakelib_mode(title_id, mode);
+  if (update_playgo && !sm_kraken_is_cache(entry.path)) {
+    send_error_response(connection, 400, EINVAL,
+                        "PlayGo stub settings require a mounted Kraken package");
+    return;
+  }
+  bool saved;
+  if (update_playgo)
+    saved = sm_config_set_title_playgo_stub_enabled(title_id, playgo_enabled);
+  else if (update_global)
+    saved = sm_config_set_title_global_fakelib_excluded(title_id, global_excluded);
+  else
+    saved = sm_config_set_title_fakelib_mode(title_id, mode);
   if (!saved) {
     int status = errno != 0 ? errno : EIO;
     send_error_response(connection, operation_http_status(status), status,
@@ -3163,6 +3185,8 @@ static void handle_game_fakelib(struct MHD_Connection *connection,
                            sm_config_title_fakelib_override(&cfg, title_id))) ||
       !add_json_bool(response, "fakelib_effective_enabled",
                      enabled && cfg.backport_fakelib_enabled) ||
+      (update_playgo && !add_json_bool(response, "playgo_stub_enabled",
+                     !sm_config_title_playgo_stub_disabled(&cfg, title_id))) ||
       !add_json_bool(response, "saved", true) ||
       !add_json_bool(response, "applies_on_next_launch", true)) {
     if (response)

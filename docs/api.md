@@ -396,6 +396,12 @@ legacy `global_fakelib_exclude_title` entries. The game's own fakelib mode stays
 unchanged. Changes apply on the next launch and preserve active mounts.
 The fakelib route accepts only known PS5 games, including PKGs, images and
 folders. `PPSA` identifies PS5; homebrew uses its `app.db` platform.
+
+Details for a Kraken-mounted PKG expose `playgo_stub_enabled` when the game
+can use the bundled stub or has a saved opt-out. Post `title_id` and a boolean
+`playgo_stub_enabled` to `/api/v1/games/fakelib` to save the preference.
+Send this setting on its own. The bundled stub policy takes effect on the
+next launch, including for titles already using an applied LIH patch.
 Send `mode: "full"`, `"emulators"` or `"disabled"` to persist an explicit override,
 or `mode: "default"` to remove it and inherit `fakelib_default_mode`.
 Legacy `enabled: true|false` requests remain supported and select explicit

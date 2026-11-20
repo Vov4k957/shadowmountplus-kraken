@@ -2186,7 +2186,9 @@ static bool mount_fakelib_for_game_locked(pid_t pid, const char *title_id,
     }
   }
 
-  if (kraken && !sm_kraken_refresh_runtime(managed_game_path))
+  if (kraken && !sm_kraken_refresh_runtime(
+          managed_game_path, cfg.update_emulators_enabled ? cfg.emulators_path : NULL,
+          !sm_config_title_playgo_stub_disabled(&cfg, title_id)))
     log_debug("  [FAKELIB] Kraken runtime refresh failed for %s: %s", title_id, strerror(errno));
 
   if (fakelib_enabled && !kraken) {

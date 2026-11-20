@@ -37,8 +37,11 @@ bool sm_kraken_source(const char *cache, char path[MAX_PATH]);
 bool sm_kraken_source_ready(const char *cache);
 // Resolve the verified source and grant the game read access before mounting it.
 bool sm_kraken_launch_source(const char *cache, char source[MAX_PATH]);
-// Refresh the bundled module in a compatible cache before mounting its fakelib.
-bool sm_kraken_refresh_runtime(const char *cache);
+// Apply the shared AMPR and per-title stub policy before mounting fakelib.
+bool sm_kraken_refresh_runtime(const char *cache, const char *emulators_path,
+                               bool playgo_stub_enabled);
+// Whether this cache can use the bundled PlayGo stub.
+bool sm_kraken_has_bundled_playgo(const char *cache);
 // Report and recover a registered cache whose selected base path is stale.
 bool sm_kraken_can_relink(const char *cache, const sm_pkg_info_t *base);
 bool sm_kraken_relink_base(const sm_pkg_info_t *base, const sm_kraken_job_t *job,

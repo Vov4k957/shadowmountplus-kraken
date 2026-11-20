@@ -210,6 +210,18 @@ Files named `dlc_emu.ini` and `playgo_stub.dat` at the package root are staged
 as separate files so that game and backport modules can read them.
 For a PKG game whose staged executable references PlayGo, SMP supplies
 drakmor's `pgo_stub` 0.6 when the game or backport supplies no PlayGo module.
+To turn the bundled stub off for a title, open its **Details** in **Library**
+and turn off **Use bundled PlayGo stub**. SMP saves the setting as
+`playgo_stub = off` in that title's section of `profiles.ini` and applies it
+when the game next starts.
+
+Kraken-mounted PKGs, including those with a LIH update, can load
+`libSceAmpr.sprx` from the same `[emulators] path` as other games. The default
+path is `/data/shadowmount/emus`. Enable `[emulators] update_enabled` and use a
+build of AMPR-emu-NG with debug PKG support. SMP falls back to the bundled
+library if the shared module is absent or fails validation. Replacing the
+shared module takes effect when the game next starts, using the existing
+cache and LIH update.
 
 For installed games, use the **Library** details to review updates and DLC and remove them individually. Deleting an installer `.pkg` file in **Installation** removes that file, **not** the already installed game. Conversely, uninstalling a game from **Library** does not automatically delete the original PKG installer.
 
