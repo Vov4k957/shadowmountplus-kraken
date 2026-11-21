@@ -186,8 +186,12 @@ static int backup_current(int volume, const sm_ps5save_request_t *r,
   if (fstat(volume, &fs) != 0 ||
       ensure_dir(home) || ensure_dir(user) || ensure_dir(title)) return -1;
   time_t when = time(NULL);
-  int n = snprintf(backup_out, cap, "%s/%lld-%ld-%s", title,
-                   (long long)when, (long)getpid(), r->image);
+  char snapshot[700];
+  int n = snprintf(snapshot, sizeof snapshot, "%s/%lld-%ld", title,
+                   (long long)when, (long)getpid());
+  if (n <= 0 || (size_t)n >= sizeof snapshot ||
+      mkdir(snapshot, 0700) != 0) return -1;
+  n = snprintf(backup_out, cap, "%s/%s", snapshot, r->image);
   if (n <= 0 || (size_t)n >= cap || copy_exclusive(image, backup_out)) return -1;
   if (key) {
     char to_key[1100];
@@ -290,6 +294,14 @@ done:
     } else mounted = false;
   }
   if (temp[0]) unlink(temp);
+  /* Sony can fail a mount *after* attaching a volume. Never unlink its
+   * backing file if the mount point is still occupied. */
+  if (work[0] && busy_mountpoint()) {
+    why = "mount_orphan_staging_preserved";
+    work[0] = ' ';
+    work_key[0] = ' ';
+    rc = -1;
+  }
   if (work_key[0]) unlink(work_key);
   if (work[0]) unlink(work);
   if (slot >= 0) close(slot);
