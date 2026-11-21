@@ -36,7 +36,9 @@ const el = id => document.getElementById(id);
 let entries=[], mounted=false, busy=false;
 function say(message,cls){el("status").className=cls||"";el("status").textContent=message;}
 async function api(path,body){
- const response=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body),cache:"no-store"});
+ const headers={"Content-Type":"application/json"};
+ if(path==="/api/v1/saves/restore")headers["X-SM-Save-Restore"]="confirmed";
+ const response=await fetch(path,{method:"POST",headers,body:JSON.stringify(body),cache:"no-store"});
  const value=await response.json();
  if(!response.ok)throw Error(value.error||value.message||"HTTP "+response.status);
  return value;
