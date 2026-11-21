@@ -3260,8 +3260,22 @@ static void handle_sm_saves_restore(struct MHD_Connection *connection,
     send_error_response(connection, 400, EINVAL, "invalid PS5Save request");
     return;
   }
+  /* A save mutation must not race the library scanner, a Kraken game
+   * installation or ShellCore preparing a title to launch. */
+  if (!sm_scanner_try_begin_external_mutation()) {
+    send_operation_error_response(connection, EBUSY, "scanner_busy");
+    return;
+  }
+  if (!sm_shellcore_try_begin_external_mutation()) {
+    sm_scanner_end_external_mutation();
+    send_operation_error_response(connection, EBUSY, "runtime_busy");
+    return;
+  }
   const char *reason = "unknown";
-  if (sm_ps5save_restore(&r, &reason) != 0) {
+  int restore_status = sm_ps5save_restore(&r, &reason);
+  sm_shellcore_end_external_mutation();
+  sm_scanner_end_external_mutation();
+  if (restore_status != 0) {
     int status = (!strcmp(reason, "restore_busy") ||
                   !strcmp(reason, "game_running") ||
                   !strcmp(reason, "mount_busy_or_orphaned")) ? EBUSY : EIO;
