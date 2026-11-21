@@ -1,7 +1,7 @@
 #ifndef SM_PS5SAVE_RESTORE_H
 #define SM_PS5SAVE_RESTORE_H
 #include <stddef.h>
-#include <json-c/json.h>
+struct json_object;
 
 /* PS5Save on the internal M.2, matching PS5Upload-12.4.20-PS5Save-M2. */
 #define SM_PS5SAVE_VOLUME "/mnt/ext1"
