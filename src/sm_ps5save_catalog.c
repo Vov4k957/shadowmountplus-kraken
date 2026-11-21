@@ -6,6 +6,7 @@
  */
 #include "sm_platform.h"
 #include "sm_ps5save_restore.h"
+#include <json-c/json.h>
 #include <dirent.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
