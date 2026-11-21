@@ -2,7 +2,9 @@
  * Host-only safety fixtures for the PS5Upload 12.4.20 M.2 slot engine port.
  * No Sony mount functions or PS5 are required for this test.
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "sm_ps5save_restore.h"
 #include <assert.h>
 #include <fcntl.h>
