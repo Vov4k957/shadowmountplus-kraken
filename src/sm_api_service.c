@@ -11,6 +11,7 @@
 
 #include "sm_api_protocol.h"
 #include "sm_api_service.h"
+#include "sm_ps5save_restore.h"
 #include "sm_appdb.h"
 #include "sm_config_mount.h"
 #include "sm_filesystem.h"
@@ -66,6 +67,8 @@
 
 extern unsigned char web_index_html[];
 extern unsigned int web_index_html_len;
+extern unsigned char web_saves_html[];
+extern unsigned int web_saves_html_len;
 extern unsigned char smp_icon_png[];
 extern unsigned int smp_icon_png_len;
 
@@ -3198,11 +3201,107 @@ static void handle_game_fakelib(struct MHD_Connection *connection,
   json_object_put(response);
 }
 
+
+/* Integrated PS5Save M.2 restoration. The old PS5Upload payload isn't called. */
+static bool sm_save_json_field(struct json_object *request, const char *name,
+                               char *out, size_t cap, bool required) {
+  struct json_object *value = NULL;
+  if (!json_object_object_get_ex(request, name, &value)) {
+    if (required) return false;
+    if (cap) out[0] = '\0';
+    return true;
+  }
+  if (!value || !json_object_is_type(value, json_type_string)) return false;
+  const char *str = json_object_get_string(value);
+  size_t n = (size_t)json_object_get_string_len(value);
+  if (!str || n >= cap || strlen(str) != n) return false;
+  memcpy(out, str, n + 1);
+  return true;
+}
+static void handle_sm_saves_catalog(struct MHD_Connection *connection,
+                                    struct json_object *request) {
+  char user[9] = {0};
+  if (!sm_save_json_field(request, "user", user, sizeof user, false)) {
+    send_error_response(connection, 400, EINVAL, "bad user id");
+    return;
+  }
+  struct json_object *response = sm_ps5save_catalog(user);
+  if (!response) { send_out_of_memory_response(connection); return; }
+  (void)send_json_object(connection, 200, response);
+  json_object_put(response);
+}
+static void handle_sm_saves_restore(struct MHD_Connection *connection,
+                                    struct json_object *request) {
+  /* Require an intentional same-origin UI call. JSON/CORS alone is not a
+   * CSRF boundary because SMP's existing API allows CORS on the LAN. */
+  const char *ack = MHD_lookup_connection_value(connection, MHD_HEADER_KIND,
+                                               "X-SM-Save-Restore");
+  const char *origin = MHD_lookup_connection_value(connection, MHD_HEADER_KIND,
+                                                  MHD_HTTP_HEADER_ORIGIN);
+  const char *host = MHD_lookup_connection_value(connection, MHD_HEADER_KIND,
+                                                MHD_HTTP_HEADER_HOST);
+  char expected_origin[256];
+  if (!ack || strcmp(ack, "confirmed") || !host ||
+      snprintf(expected_origin, sizeof(expected_origin), "http://%s", host) >=
+          (int)sizeof(expected_origin) ||
+      (origin && strcmp(origin, expected_origin))) {
+    send_error_response(connection, 403, EACCES,
+                        "restore requires same-origin explicit confirmation");
+    return;
+  }
+  sm_ps5save_request_t r = {0};
+  if (!sm_save_json_field(request, "user", r.user, sizeof r.user, true) ||
+      !sm_save_json_field(request, "backup_user", r.backup_user, sizeof r.backup_user, true) ||
+      !sm_save_json_field(request, "title_id", r.title_id, sizeof r.title_id, true) ||
+      !sm_save_json_field(request, "platform", r.platform, sizeof r.platform, true) ||
+      !sm_save_json_field(request, "version", r.version, sizeof r.version, true) ||
+      !sm_save_json_field(request, "slot", r.slot, sizeof r.slot, true) ||
+      !sm_save_json_field(request, "image", r.image, sizeof r.image, true)) {
+    send_error_response(connection, 400, EINVAL, "invalid PS5Save request");
+    return;
+  }
+  /* A save mutation must not race the library scanner, a Kraken game
+   * installation or ShellCore preparing a title to launch. */
+  if (!sm_scanner_try_begin_external_mutation()) {
+    send_operation_error_response(connection, EBUSY, "scanner_busy");
+    return;
+  }
+  if (!sm_shellcore_try_begin_external_mutation()) {
+    sm_scanner_end_external_mutation();
+    send_operation_error_response(connection, EBUSY, "runtime_busy");
+    return;
+  }
+  const char *reason = "unknown";
+  int restore_status = sm_ps5save_restore(&r, &reason);
+  sm_shellcore_end_external_mutation();
+  sm_scanner_end_external_mutation();
+  if (restore_status != 0) {
+    int status = (!strcmp(reason, "restore_busy") ||
+                  !strcmp(reason, "game_running") ||
+                  !strcmp(reason, "mount_busy_or_orphaned")) ? EBUSY : EIO;
+    send_operation_error_response(connection, status, reason);
+    return;
+  }
+  struct json_object *response = new_status_response(0);
+  if (!response || !add_json_bool(response, "restored", true) ||
+      !add_json_string(response, "title_id", r.title_id)) {
+    if (response) json_object_put(response);
+    send_out_of_memory_response(connection);
+    return;
+  }
+  (void)send_json_object(connection, 200, response);
+  json_object_put(response);
+}
+
 static void dispatch_request(struct MHD_Connection *connection,
                              const char *route,
                              struct json_object *json) {
   if (strcmp(route, SM_API_ROUTE_VERSION) == 0) {
     handle_version(connection);
+  } else if (strcmp(route, SM_API_ROUTE_SAVES_CATALOG) == 0) {
+    handle_sm_saves_catalog(connection, json);
+  } else if (strcmp(route, SM_API_ROUTE_SAVES_RESTORE) == 0) {
+    handle_sm_saves_restore(connection, json);
   } else if (strcmp(route, SM_API_ROUTE_STORAGE) == 0) {
     handle_storage(connection, json);
   } else if (strcmp(route, SM_API_ROUTE_STORAGE_EJECT) == 0) {
@@ -6366,6 +6465,10 @@ static enum MHD_Result handle_http_request(
     bool queued = false;
     if (strcmp(url, SM_API_ROUTE_INDEX) == 0)
       queued = handle_index_page(connection);
+    else if (strcmp(url, SM_API_ROUTE_SAVES_PAGE) == 0)
+      queued = send_embedded_response(connection, web_saves_html,
+                                      (size_t)web_saves_html_len,
+                                      "text/html; charset=utf-8", "no-store");
     else if (strcmp(url, SM_API_ROUTE_FAVICON) == 0)
       queued = send_embedded_response(connection, smp_icon_png,
                                        (size_t)smp_icon_png_len,

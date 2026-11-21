@@ -557,6 +557,12 @@ int main(void) {
   sceAppInstUtilInitialize();
   kernel_set_ucred_authid(-1, AUTHID_BASE);
   install_signal_handlers();
+  /* All workers inherit SIGPIPE blocked. Sony save mounting briefly
+   * changes SIGPIPE to default on its own thread (FW 13.60). */
+  sigset_t sm_save_sigpipe;
+  sigemptyset(&sm_save_sigpipe);
+  sigaddset(&sm_save_sigpipe, SIGPIPE);
+  (void)pthread_sigmask(SIG_BLOCK, &sm_save_sigpipe, NULL);
 
   mkdir(LOG_DIR, 0777);
   existing_pid = find_pid_by_name(PAYLOAD_NAME, true);
