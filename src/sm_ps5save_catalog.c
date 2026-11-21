@@ -100,7 +100,8 @@ static void match_targets(catalog_t *c, const char *platform,
     size_t len = strlen(image);
     if ((len >= 4 && !strcmp(image + len - 4, ".bin")) ||
         (len >= 8 && !strcmp(image + len - 8, ".unsaved")) ||
-        (len >= 10 && !strcmp(image + len - 10, ".ps5up-tmp")))
+        (len >= 10 && !strcmp(image + len - 10, ".ps5up-tmp")) ||
+        (len >= 8 && !strcmp(image + len - 8, ".smp-new")))
       continue;
     struct stat st;
     if (fstatat(targets, image, &st, AT_SYMLINK_NOFOLLOW) != 0 ||
