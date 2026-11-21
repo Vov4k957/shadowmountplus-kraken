@@ -165,6 +165,8 @@ static int game_busy(const char *title) {
   /* Conservative: no other game's write/exit may race a save restore. */
   return runtime_sleep_mode_active() ||
       sm_game_lifecycle_has_active_game() ||
+      sm_shellcore_background_work_blocked() ||
+      sm_shellcore_service_has_prepared_mount() ||
       sm_shellcore_title_is_protected(title);
 }
 static int ps4_key_path(const char *image, char *out, size_t cap) {
