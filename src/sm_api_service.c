@@ -3232,6 +3232,23 @@ static void handle_sm_saves_catalog(struct MHD_Connection *connection,
 }
 static void handle_sm_saves_restore(struct MHD_Connection *connection,
                                     struct json_object *request) {
+  /* Require an intentional same-origin UI call. JSON/CORS alone is not a
+   * CSRF boundary because SMP's existing API allows CORS on the LAN. */
+  const char *ack = MHD_lookup_connection_value(connection, MHD_HEADER_KIND,
+                                               "X-SM-Save-Restore");
+  const char *origin = MHD_lookup_connection_value(connection, MHD_HEADER_KIND,
+                                                  MHD_HTTP_HEADER_ORIGIN);
+  const char *host = MHD_lookup_connection_value(connection, MHD_HEADER_KIND,
+                                                MHD_HTTP_HEADER_HOST);
+  char expected_origin[256];
+  if (!ack || strcmp(ack, "confirmed") || !host ||
+      snprintf(expected_origin, sizeof(expected_origin), "http://%s", host) >=
+          (int)sizeof(expected_origin) ||
+      (origin && strcmp(origin, expected_origin))) {
+    send_error_response(connection, 403, EACCES,
+                        "restore requires same-origin explicit confirmation");
+    return;
+  }
   sm_ps5save_request_t r = {0};
   if (!sm_save_json_field(request, "user", r.user, sizeof r.user, true) ||
       !sm_save_json_field(request, "backup_user", r.backup_user, sizeof r.backup_user, true) ||
