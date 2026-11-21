@@ -62,7 +62,8 @@ int sm_ps5save_restore_image(const sm_ps5save_request_t *r,
       !title_id(r->title_id) || !version(r->version) ||
       !filename(r->slot) || !filename(name) ||
       strncmp(name, "sce_bu_", 7) == 0 || suffix(name, ".bin") ||
-      suffix(name, ".ps5up-tmp") || suffix(name, ".unsaved") ||
+      suffix(name, ".ps5up-tmp") || suffix(name, ".smp-new") ||
+      suffix(name, ".unsaved") ||
       (ps4 && !prefixed)) return -1;
   int n = snprintf(path, cap, "/user/home/%s/%s/%s/%s", r->user,
                    ps4 ? "savedata" : "savedata_prospero",
