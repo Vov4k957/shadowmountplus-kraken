@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
+  <meta name="shadowmount-saves" content="1">
   <title>ShadowMount+ Library</title>
   <link rel="icon" type="image/png" sizes="512x512" href="/favicon.png">
   <style>
@@ -570,6 +571,26 @@
     .console-section { min-width: 0; text-align: left; border-color: transparent; background: transparent; color: var(--muted); transition: none; }
     .console-section.active { background: #dceeff; color: #0c2340; font-weight: 650; }
     .console-content, .console-pane { min-width: 0; }
+    .saves-view { display: grid; gap: 18px; min-width: 0; }
+    .saves-view .console-heading, .saves-view .package-toolbar { margin-bottom: 0; }
+    .save-actions, .save-filters { display: grid; gap: 10px; align-items: end; }
+    .save-actions { grid-template-columns: minmax(0, 1fr) auto; }
+    .save-filters { grid-template-columns: repeat(2, minmax(0, 1fr)) minmax(0, 1.5fr) auto; margin: 16px 0; }
+    .save-filters label { display: grid; gap: 5px; min-width: 0; }
+    .save-filters select, .save-filters input { width: 100%; min-width: 0; }
+    .save-list { display: grid; gap: 8px; }
+    .save-row { display: grid; align-items: center; gap: 12px; padding: 12px 14px; background: #101e32; border: 1px solid var(--line); border-radius: 12px; grid-template-columns: minmax(0, 1fr) minmax(110px, 28%) auto; }
+    .save-row > div, .save-row select { min-width: 0; overflow-wrap: anywhere; }
+    .save-row .subtle, .save-schedule { display: block; margin-top: 4px; }
+    .saves-error { color: var(--red); }
+    @media (max-width: 660px) {
+      .save-filters { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 540px) {
+      .save-actions, .save-row { grid-template-columns: minmax(0, 1fr) auto; }
+      .save-actions > div, .save-row > div { grid-column: 1 / -1; }
+      .save-actions > button { grid-column: 1 / -1; }
+    }
     .console-heading { margin-bottom: 18px; }
     .console-heading h2 { margin-bottom: 5px; font-size: 27px; }
     .console-heading p { margin: 0; }
@@ -881,8 +902,8 @@
       <nav class="view-nav" aria-label="Navigation" data-i18n-aria-label="navigate">
         <button class="btn view-tab active" id="libraryTab" type="button" aria-pressed="true" data-i18n="library">Library</button>
         <button class="btn view-tab" id="packagesTab" type="button" aria-pressed="false" data-i18n="packagesTab">Installation</button>
+        <button class="btn view-tab" id="savesTab" type="button" aria-controls="savesView" aria-pressed="false" data-i18n="savesTab">Saves</button>
         <button class="btn view-tab" id="consoleTab" type="button" aria-pressed="false" data-i18n="settings">Settings</button>
-        <a class="btn view-tab" href="/saves" style="display:inline-flex;align-items:center;justify-content:center;text-decoration:none">Сохранения</a>
       </nav>
       <div class="topbar-actions">
         <div class="connection" id="connection" role="status">
@@ -954,6 +975,34 @@
           </div>
           <div class="package-list" id="packageList" aria-live="polite"></div>
 
+        </div>
+      </section>
+
+      <section class="saves-view" id="savesView" hidden aria-labelledby="savesHeading">
+        <div class="console-heading"><h2 id="savesHeading" data-i18n="savesTab">Saves</h2></div>
+        <div class="panel">
+          <h3 data-i18n="savesBackupHeading">Back up to M.2</h3>
+          <div class="save-actions">
+            <div>
+              <label class="console-setting"><span data-i18n="savesAutomatic">Automatic backups</span>
+                <input type="checkbox" id="savesAutomatic" disabled></label>
+              <span class="subtle save-schedule" id="savesSchedule"></span>
+            </div>
+            <button class="btn" id="savesRun" type="button" disabled data-i18n="savesRun">Back up now</button>
+          </div>
+          <p class="subtle console-hint" id="savesBackupStatus" role="status"></p>
+        </div>
+        <div class="panel">
+          <h3 data-i18n="savesRestoreHeading">Restore from M.2</h3>
+          <p class="subtle console-hint" data-i18n="savesRestoreHint">Close the game before restoring. If the selected profile has no save yet, create one in the game first.</p>
+          <div class="save-filters">
+            <label><span class="subtle" data-i18n="savesProfile">Profile</span><select id="savesProfile" disabled></select></label>
+            <label><span class="subtle" data-i18n="savesVersion">Backup</span><select id="savesVersion" disabled></select></label>
+            <label><span class="subtle" data-i18n="savesSearch">Game or slot</span><input id="savesSearch" type="search" autocomplete="off"></label>
+            <button class="btn" id="savesRefresh" type="button" data-i18n="refresh">Refresh</button>
+          </div>
+          <p class="subtle console-hint" id="savesRestoreStatus" role="status"></p>
+          <div class="save-list" id="savesList"></div>
         </div>
       </section>
 
@@ -1270,6 +1319,12 @@
         smbConnections: [], smbBusy: false, smbRequest: 0
       };
       const $ = (id) => document.getElementById(id);
+      const saves = {
+        catalog: null, loading: false, restoreBusy: false,
+        restoreMessage: null, backup: null, backupError: null,
+        updatingBackup: false, readingBackup: false, backupTimer: 0, backupRequest: 0
+      };
+      const mainTabs = { library: "libraryTab", packages: "packagesTab", saves: "savesTab", console: "consoleTab" };
       const navigation = {
         view: "library", lastGame: "", dialogs: [],
         padFrame: 0, padCommand: "", padRepeatAt: 0, padScrollAt: 0, keyboardAt: 0,
@@ -3139,6 +3194,90 @@
         "id-ID": ["B", "KiB", "MiB", "GiB", "TiB"],
         "uk-UA": ["Б", "КіБ", "МіБ", "ГіБ", "ТіБ"]
       };
+      Object.assign(translations["en-US"], {
+        savesTab: "Saves",
+        savesBackupHeading: "Back up to M.2",
+        savesAutomatic: "Automatic backups",
+        savesRun: "Back up now",
+        savesSchedule: "Every {seconds} s · Daily snapshots kept: {days} · {platforms}",
+        savesPlatformsOff: "Game saves disabled in backup.conf",
+        savesBackupWaiting: "Waiting for the next backup pass.",
+        savesBackupReady: "Last backup pass complete.",
+        savesBackupQueued: "Backup queued.",
+        savesBackupRunning: "Backing up to M.2…",
+        savesBackupManualComplete: "Manual backup pass complete.",
+        savesBackupPaused: "Automatic backups paused.",
+        savesBackupNoM2: "A writable M.2 is unavailable.",
+        savesBackupNoConfig: "The backup configuration is missing from /mnt/ext1/PS5Save/backup.conf.",
+        savesBackupStandalone: "The standalone backup payload is running. Stop it before starting an integrated backup.",
+        savesBackupFailed: "Backup incomplete. See the SM+ log for details.",
+        savesBackupUnavailable: "Backup worker unavailable.",
+        savesRestoreHeading: "Restore from M.2",
+        savesRestoreHint: "Close the game before restoring. If the selected profile has no save yet, create one in the game first.",
+        savesProfile: "Profile",
+        savesVersion: "Backup",
+        savesAllVersions: "All backups",
+        savesLatest: "Latest backup",
+        savesSearch: "Game or slot",
+        savesTarget: "Destination slot",
+        savesRestore: "Restore",
+        savesGetCopies: "Reading backups from M.2…",
+        savesNoM2: "M.2 is unavailable.",
+        savesNoMatches: "No matching backups.",
+        savesTargetMissing: "Create a save in this game on the selected profile first.",
+        savesTruncated: "Showing the first {count} restore options.",
+        savesConfirm: "Restore {game}, slot {slot}, from {version} to profile {user}, slot {target}? The current save will be backed up before replacement.",
+        savesRestoring: "Restoring {game}…",
+        savesRestored: "Restored {game}. The previous save is in {path}.",
+        savesFailed: "Restore failed: {reason}",
+        savesBackupBusy: "A backup or another save operation is in progress.",
+        savesGameRunning: "Close the game completely and try again.",
+        savesSourceMissing: "The backup is missing or incomplete.",
+        savesBusy: "SM+ is busy. Try again when the current operation finishes.",
+        savesReadFailed: "Could not load saves: {reason}"
+      });
+      Object.assign(translations["ru-RU"], {
+        savesTab: "Сохранения",
+        savesBackupHeading: "Копирование на M.2",
+        savesAutomatic: "Автоматическое копирование",
+        savesRun: "Скопировать сейчас",
+        savesSchedule: "Каждые {seconds} сек. · Дневных снимков: {days} · {platforms}",
+        savesPlatformsOff: "Игровые сохранения отключены в backup.conf",
+        savesBackupWaiting: "Ожидание следующего прохода.",
+        savesBackupReady: "Последний проход копирования завершён.",
+        savesBackupQueued: "Копирование поставлено в очередь.",
+        savesBackupRunning: "Копирование на M.2…",
+        savesBackupManualComplete: "Ручное копирование завершено.",
+        savesBackupPaused: "Автоматическое копирование приостановлено.",
+        savesBackupNoM2: "Диск M.2 недоступен для записи.",
+        savesBackupNoConfig: "Файл настроек /mnt/ext1/PS5Save/backup.conf не найден.",
+        savesBackupStandalone: "Запущена отдельная нагрузка резервного копирования. Останови её перед запуском встроенной.",
+        savesBackupFailed: "Копирование завершилось с ошибками. Подробности в журнале SM+.",
+        savesBackupUnavailable: "Служба резервного копирования недоступна.",
+        savesRestoreHeading: "Восстановление с M.2",
+        savesRestoreHint: "Полностью закрой игру перед восстановлением. Если у профиля ещё нет сохранения, сначала создай его в игре.",
+        savesProfile: "Профиль",
+        savesVersion: "Копия",
+        savesAllVersions: "Все копии",
+        savesLatest: "Последняя копия",
+        savesSearch: "Игра или слот",
+        savesTarget: "Слот назначения",
+        savesRestore: "Восстановить",
+        savesGetCopies: "Читаю копии с M.2…",
+        savesNoM2: "Диск M.2 недоступен.",
+        savesNoMatches: "Подходящих копий нет.",
+        savesTargetMissing: "Сначала создай сохранение в этой игре на выбранном профиле.",
+        savesTruncated: "Показаны первые {count} вариантов восстановления.",
+        savesConfirm: "Восстановить {game}, слот {slot}, из копии «{version}» в профиль {user}, слот {target}? Перед заменой текущий сейв будет скопирован.",
+        savesRestoring: "Восстанавливаю {game}…",
+        savesRestored: "Сохранение {game} восстановлено. Предыдущая копия лежит в {path}.",
+        savesFailed: "Восстановление не выполнено. {reason}",
+        savesBackupBusy: "Идёт копирование или другая операция с сохранениями.",
+        savesGameRunning: "Полностью закрой игру и повтори попытку.",
+        savesSourceMissing: "Копия отсутствует или записана не полностью.",
+        savesBusy: "SM+ занят. Повтори после завершения текущей операции.",
+        savesReadFailed: "Не удалось загрузить сохранения. {reason}"
+      });
       const supportedLanguages = Object.keys(translations);
       const defaultLanguage = "en-US";
       function resolveLanguage(language) {
@@ -3194,6 +3333,7 @@
         renderActivity();
         renderSmbConnections();
         renderPackageQueue();
+        if (navigation.view === "saves") renderSaves();
         if (persist) {
           try { localStorage.setItem("shadowmount.language", currentLanguage); } catch (_) { /* Keep the in-memory selection. */ }
         }
@@ -3272,10 +3412,10 @@
           ? t(operationErrorKeys[reason], { path }) : fallback;
       }
 
-      async function api(path, payload = {}) {
+      async function api(path, payload = {}, headers = {}) {
         const response = await fetch(`${API}${path}`, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json", ...headers },
           body: JSON.stringify(payload),
           cache: "no-store"
         });
@@ -3542,8 +3682,8 @@
           if (restoreFocus) {
             const selected = Array.from($("games").querySelectorAll(".game-open"))
               .find(item => item.getAttribute("data-title-id") === navigation.lastGame);
-            focusControl(activeDialog() ? focusableControls()[0] : navigation.view === "console"
-              ? $("consoleTab") : navigation.view === "packages" ? $("packagesTab") : selected || $("libraryTab"));
+            focusControl(activeDialog() ? focusableControls()[0] : navigation.view === "library"
+              ? selected || $("libraryTab") : $(mainTabs[navigation.view]));
           }
           return;
         }
@@ -3805,6 +3945,7 @@
             api("/games", { include_size: $("includeSize").checked })
           ]);
           state.games = games.games || [];
+          if (navigation.view === "saves" && !saves.restoreBusy) renderSaves();
           state.apiVersion = version;
           $("version").textContent = `ShadowMount+ ${version.shadowmount_version}`;
           setConnection("online", "connected");
@@ -4980,6 +5121,209 @@
         if (!$("consoleView").hidden) window.scrollTo(0, 0);
       }
 
+      const backupStatusKeys = {
+        waiting: "savesBackupWaiting", ready: "savesBackupReady",
+        queued: "savesBackupQueued", running: "savesBackupRunning",
+        no_m2: "savesBackupNoM2", no_config: "savesBackupNoConfig",
+        standalone_running: "savesBackupStandalone", backup_error: "savesBackupFailed",
+        unavailable: "savesBackupUnavailable"
+      };
+
+      function renderBackupStatus() {
+        const backup = saves.backup;
+        const unavailable = !backup || backup.state === "unavailable";
+        $("savesAutomatic").checked = Boolean(backup?.enabled);
+        $("savesAutomatic").disabled = unavailable || saves.updatingBackup;
+        $("savesRun").disabled = unavailable || saves.restoreBusy || saves.updatingBackup ||
+          backup.busy || backup.state === "queued";
+        const platforms = [backup?.ps4 && "PS4", backup?.ps5 && "PS5"].filter(Boolean).join(" / ");
+        $("savesSchedule").textContent = backup?.interval_seconds
+          ? t("savesSchedule", { seconds: backup.interval_seconds, days: backup.daily_snapshots, platforms: platforms || t("savesPlatformsOff") })
+          : "";
+        const status = $("savesBackupStatus");
+        const paused = backup && !backup.enabled && !backup.busy &&
+          ["waiting", "ready"].includes(backup.state);
+        status.classList.toggle("saves-error", Boolean(saves.backupError) ||
+          ["no_m2", "no_config", "standalone_running", "backup_error", "unavailable"].includes(backup?.state));
+        status.textContent = saves.backupError ||
+          t(paused ? "savesBackupPaused" : backupStatusKeys[backup?.state] || "savesBackupWaiting");
+      }
+
+      function gameNameForSave(title) {
+        const game = state.games.find(entry => entry.title_id === title);
+        return game?.title_name || title;
+      }
+
+      function saveVersionLabel(version) {
+        return version === "latest" ? t("savesLatest") : version;
+      }
+
+      function setSaveOptions(select, values, selected) {
+        while (select.firstChild) select.removeChild(select.firstChild);
+        for (const [value, label] of values) {
+          const option = node("option", "", label);
+          option.value = value;
+          select.append(option);
+        }
+        if (values.some(([value]) => value === selected)) select.value = selected;
+      }
+
+      function renderSaves() {
+        renderBackupStatus();
+        const catalog = saves.catalog;
+        const busy = saves.loading || saves.restoreBusy;
+        $("savesRefresh").disabled = busy;
+        $("savesProfile").disabled = busy || !catalog?.users?.length;
+        $("savesVersion").disabled = busy || !catalog?.items?.length;
+        const status = $("savesRestoreStatus");
+        const message = saves.restoreMessage;
+        status.classList.toggle("saves-error", Boolean(message?.error));
+        status.textContent = message ? t(message.key, message.values) :
+          saves.loading ? t("savesGetCopies") :
+          catalog?.truncated ? t("savesTruncated", { count: catalog.items.length }) : "";
+        const list = $("savesList");
+        while (list.firstChild) list.removeChild(list.firstChild);
+        if (!catalog) return;
+        if (!catalog.mounted) {
+          list.append(node("p", "empty", t("savesNoM2")));
+          return;
+        }
+        const filter = $("savesSearch").value.trim().toLowerCase();
+        const version = $("savesVersion").value;
+        const groups = new Map();
+        for (const item of catalog.items) {
+          if (version && item.version !== version) continue;
+          const title = gameNameForSave(item.title_id);
+          if (filter && ![title, item.title_id, item.slot].some(value => value.toLowerCase().includes(filter))) continue;
+          const key = JSON.stringify([item.title_id, item.platform, item.slot, item.version, item.backup_user]);
+          if (!groups.has(key)) groups.set(key, { item, title, targets: [] });
+          if (item.image) groups.get(key).targets.push(item);
+        }
+        if (!groups.size) {
+          list.append(node("p", "empty", t("savesNoMatches")));
+          return;
+        }
+        const rows = Array.from(groups.values()).sort((left, right) =>
+          left.title.localeCompare(right.title, currentLanguage) ||
+          right.item.version.localeCompare(left.item.version) ||
+          left.item.slot.localeCompare(right.item.slot));
+        for (const { item, title, targets } of rows) {
+          const row = node("div", "save-row");
+          const details = node("div");
+          details.append(node("strong", "", title === item.title_id ? title : `${title} · ${item.title_id}`),
+            node("span", "subtle", `${item.platform.toUpperCase()} · ${item.slot} · ${saveVersionLabel(item.version)} · ${item.backup_user}`));
+          row.append(details);
+          if (!targets.length) {
+            row.append(node("span", "subtle", t("savesTargetMissing")));
+          } else {
+            const target = node("select");
+            target.setAttribute("aria-label", t("savesTarget"));
+            const matching = targets.find(value => value.image.replace(/^sdimg_/, "") === item.slot);
+            setSaveOptions(target, targets.map(value => [value.image, value.image.replace(/^sdimg_/, "")]), matching?.image);
+            target.disabled = busy;
+            const button = node("button", "btn primary", t("savesRestore"));
+            button.type = "button";
+            button.disabled = busy;
+            button.addEventListener("click", () => restoreSave(targets.find(value => value.image === target.value), title));
+            row.append(target, button);
+          }
+          list.append(row);
+        }
+      }
+
+      async function loadSaveCatalog(user = $("savesProfile").value) {
+        if (saves.loading || saves.restoreBusy) return;
+        saves.loading = true;
+        saves.restoreMessage = null;
+        renderSaves();
+        try {
+          const catalog = await api("/saves/catalog", { user });
+          const selected = $("savesVersion").value;
+          const versions = Array.from(new Set(catalog.items.map(item => item.version))).sort().reverse();
+          const displayUser = value => typeof value === "string" ? [value, value] : [value.id, value.name || value.id];
+          setSaveOptions($("savesProfile"), catalog.users.map(displayUser), catalog.selected_user);
+          setSaveOptions($("savesVersion"), [["", t("savesAllVersions")],
+            ...versions.map(value => [value, saveVersionLabel(value)])], selected);
+          saves.catalog = catalog;
+        } catch (error) {
+          saves.catalog = null;
+          saves.restoreMessage = { key: "savesReadFailed", values: { reason: error.message }, error: true };
+        } finally {
+          saves.loading = false;
+          renderSaves();
+        }
+      }
+
+      async function refreshBackupStatus() {
+        if (saves.readingBackup || saves.updatingBackup) return;
+        saves.readingBackup = true;
+        const request = ++saves.backupRequest;
+        try {
+          const previous = saves.backup?.state;
+          const backup = await api("/saves/backup");
+          if (request !== saves.backupRequest) return;
+          saves.backup = backup;
+          saves.backupError = null;
+          if (["running", "queued"].includes(previous) &&
+              ["ready", "backup_error"].includes(saves.backup.state) && navigation.view === "saves" && !saves.restoreBusy) {
+            if (!backup.enabled && backup.state === "ready") toast(t("savesBackupManualComplete"));
+            loadSaveCatalog();
+          }
+        } catch (error) {
+          if (request !== saves.backupRequest) return;
+          saves.backup = null;
+          saves.backupError = error.message;
+        } finally {
+          saves.readingBackup = false;
+          renderBackupStatus();
+        }
+      }
+
+      async function changeSaveBackup(payload) {
+        if (saves.updatingBackup) return;
+        saves.backupRequest++;
+        saves.updatingBackup = true;
+        renderBackupStatus();
+        try {
+          saves.backup = await api("/saves/backup", payload, { "X-SM-Save-Backup": "confirmed" });
+          saves.backupError = null;
+        } catch (error) {
+          saves.backupError = error.message;
+        } finally {
+          saves.updatingBackup = false;
+          renderBackupStatus();
+        }
+      }
+
+      async function restoreSave(item, title) {
+        if (!item || saves.restoreBusy || saves.loading) return;
+        const game = title;
+        if (!await confirmAction(t("savesConfirm", {
+          game, slot: item.slot, version: saveVersionLabel(item.version),
+          user: $("savesProfile").selectedOptions[0]?.textContent || item.user,
+          target: item.image.replace(/^sdimg_/, "")
+        }), t("savesRestore"))) return;
+        saves.restoreBusy = true;
+        saves.restoreMessage = { key: "savesRestoring", values: { game } };
+        renderSaves();
+        try {
+          const result = await api("/saves/restore", item, { "X-SM-Save-Restore": "confirmed" });
+          if (!result.restored) throw new Error(t("savesBackupUnavailable"));
+          saves.restoreMessage = { key: "savesRestored", values: { game, path: result.backup_path } };
+        } catch (error) {
+          const reason = {
+            backup_busy: "savesBackupBusy", restore_busy: "savesBackupBusy", game_running: "savesGameRunning",
+            scanner_busy: "savesBusy", runtime_busy: "savesBusy", m2_not_mounted: "savesNoM2",
+            backup_missing_or_incomplete: "savesSourceMissing", target_missing: "savesTargetMissing"
+          }[error.reason];
+          saves.restoreMessage = { key: "savesFailed", values: { reason: reason ? t(reason) : error.message }, error: true };
+        } finally {
+          saves.restoreBusy = false;
+          renderSaves();
+          if (navigation.view === "saves" && !activeDialog()) focusControl($("savesRefresh"));
+        }
+      }
+
       function switchView(view) {
         navigation.view = view;
         const library = view === "library";
@@ -4988,18 +5332,27 @@
         document.querySelector(".stats").hidden = !library;
         $("consoleView").hidden = view !== "console";
         $("packagesView").hidden = view !== "packages";
-        for (const [id, selected] of [["libraryTab", library], ["consoleTab", view === "console"], ["packagesTab", view === "packages"]]) {
+        $("savesView").hidden = view !== "saves";
+        for (const [name, id] of Object.entries(mainTabs)) {
+          const selected = name === view;
           $(id).classList.toggle("active", selected);
           $(id).setAttribute("aria-pressed", String(selected));
         }
         window.scrollTo(0, 0);
-        focusControl($({ library: "libraryTab", console: "consoleTab", packages: "packagesTab" }[view]));
+        focusControl($(mainTabs[view]));
         if (view === "packages") { refreshPackages(); refreshStorage(); }
+        clearInterval(saves.backupTimer);
+        if (view === "saves") {
+          if (!saves.catalog) loadSaveCatalog();
+          else renderSaves();
+          refreshBackupStatus();
+          saves.backupTimer = setInterval(refreshBackupStatus, 2500);
+        }
       }
 
       function switchMainTab(direction) {
         if (activeDialog() || (!playStationBrowser && isNativeEditor(document.activeElement))) return;
-        const views = ["library", "packages", "console"];
+        const views = Object.keys(mainTabs);
         const index = views.indexOf(navigation.view);
         switchView(views[(index + direction + views.length) % views.length]);
       }
@@ -6090,6 +6443,13 @@
       }
 
       $("packagesTab").addEventListener("click", () => switchView("packages"));
+      $("savesTab").addEventListener("click", () => switchView("saves"));
+      $("savesRefresh").addEventListener("click", () => { loadSaveCatalog(); refreshBackupStatus(); });
+      $("savesProfile").addEventListener("change", () => loadSaveCatalog());
+      $("savesSearch").addEventListener("input", renderSaves);
+      $("savesVersion").addEventListener("change", renderSaves);
+      $("savesRun").addEventListener("click", () => changeSaveBackup({ run: true }));
+      $("savesAutomatic").addEventListener("change", event => changeSaveBackup({ enabled: event.target.checked }));
       $("packageHome").addEventListener("click", () => refreshPackages("", true));
       $("packageUp").addEventListener("click", () => refreshPackages(state.packages?.parent || "", true));
       $("packageRefresh").addEventListener("click", () => { refreshPackages(); refreshStorage(); });
@@ -6238,6 +6598,7 @@
       $("smbClearPassword").addEventListener("change", syncSmbAuthControls);
       applyLanguage(currentLanguage);
       initializeTabHistory();
+      if (location.pathname === "/saves") switchView("saves");
       Promise.all([refreshAll(), refreshManual(), refreshSettings(), refreshStorageJob(), refreshSmbConnections()]);
     })();
   </script>

@@ -12,6 +12,8 @@
 #include <sys/stat.h>
 
 #define SMP_CATALOG_LIMIT 512u
+int sceUserServiceGetUserName(int user_id, char *name, size_t max_size);
+int sceUserServiceGetForegroundUser(int *user_id);
 typedef struct {
   struct json_object *items;
   const char *selected_user;
@@ -74,29 +76,39 @@ static void append_item(catalog_t *c, const char *platform,
   json_object_object_add(obj, "title_id", json_object_new_string(title));
   json_object_object_add(obj, "slot", json_object_new_string(slot));
   json_object_object_add(obj, "version", json_object_new_string(version));
-  json_object_object_add(obj, "image", json_object_new_string(image));
+  if (image) json_object_object_add(obj, "image", json_object_new_string(image));
   json_object_array_add(c->items, obj);
   c->count++;
 }
-static void match_targets(catalog_t *c, const char *platform,
-                          const char *backup_user, const char *title,
-                          const char *slot, const char *version) {
-  if (!c->selected_user || !*c->selected_user || c->truncated) return;
-  bool ps4 = strcmp(platform, "ps4") == 0;
+typedef struct {
+  char (*images)[200];
+  size_t count;
+  size_t capacity;
+  bool truncated;
+} target_list_t;
+
+static target_list_t load_targets(const catalog_t *c, const char *platform,
+                                  const char *title) {
+  target_list_t result = {0};
+  if (!c->selected_user[0]) return result;
+  const bool ps4 = strcmp(platform, "ps4") == 0;
   char path[512];
   int n = snprintf(path, sizeof(path), "/user/home/%s/%s/%s",
                    c->selected_user,
                    ps4 ? "savedata" : "savedata_prospero", title);
-  if (n < 0 || (size_t)n >= sizeof(path)) return;
-  int targets = directory(path);
-  if (targets < 0) return;
-  DIR *dir = fdopendir(targets);
-  if (!dir) { close(targets); return; }
+  int targets = n < 0 || (size_t)n >= sizeof(path) ? -1 : directory(path);
+  DIR *dir = targets >= 0 ? fdopendir(targets) : NULL;
+  if (!dir) {
+    if (targets >= 0) close(targets);
+    return result;
+  }
   const struct dirent *entry;
-  while ((entry = readdir(dir)) != NULL && !c->truncated) {
+  while ((entry = readdir(dir)) != NULL) {
     const char *image = entry->d_name;
-    if (!safe_name(image) || !strncmp(image, "sce_bu_", 7) ||
-        (ps4 && strncmp(image, "sdimg_", 6) != 0)) continue;
+    const bool prefixed = strncmp(image, "sdimg_", 6) == 0;
+    const char *slot_name = prefixed ? image + 6 : image;
+    if (!safe_name(image) || !safe_name(slot_name) || !strncmp(slot_name, "sce_bu_", 7) ||
+        (ps4 && !prefixed)) continue;
     size_t len = strlen(image);
     if ((len >= 4 && !strcmp(image + len - 4, ".bin")) ||
         (len >= 8 && !strcmp(image + len - 8, ".unsaved")) ||
@@ -106,11 +118,53 @@ static void match_targets(catalog_t *c, const char *platform,
     struct stat st;
     if (fstatat(targets, image, &st, AT_SYMLINK_NOFOLLOW) != 0 ||
         !S_ISREG(st.st_mode)) continue;
-    append_item(c, platform, c->selected_user, backup_user, title,
-                slot, version, image);
+    if (ps4) {
+      char key[204];
+      snprintf(key, sizeof key, "%s.bin", slot_name);
+      if (fstatat(targets, key, &st, AT_SYMLINK_NOFOLLOW) != 0 ||
+          !S_ISREG(st.st_mode)) continue;
+    }
+    if (result.count >= SMP_CATALOG_LIMIT) {
+      result.truncated = true;
+      break;
+    }
+    if (result.count == result.capacity) {
+      size_t capacity = result.capacity ? result.capacity * 2 : 8;
+      void *next = realloc(result.images, capacity * sizeof *result.images);
+      if (!next) {
+        result.truncated = true;
+        break;
+      }
+      result.images = next;
+      result.capacity = capacity;
+    }
+    strcpy(result.images[result.count++], image);
   }
   closedir(dir);
+  return result;
 }
+
+static void append_slot(catalog_t *c, const target_list_t *targets,
+                        const char *platform, const char *backup_user,
+                        const char *title, const char *slot, const char *version) {
+  if (!targets->count) {
+    append_item(c, platform, c->selected_user, backup_user, title,
+                slot, version, NULL);
+    return;
+  }
+  for (size_t i = 0; i < targets->count && !c->truncated; i++) {
+    const char *image = targets->images[i];
+    const char *name = strncmp(image, "sdimg_", 6) == 0 ? image + 6 : image;
+    if (strcmp(name, slot) == 0) {
+      append_item(c, platform, c->selected_user, backup_user, title, slot, version, image);
+      return;
+    }
+  }
+  for (size_t i = 0; i < targets->count && !c->truncated; i++)
+    append_item(c, platform, c->selected_user, backup_user, title, slot,
+                version, targets->images[i]);
+}
+
 static void scan_slots(catalog_t *c, int title_fd, const char *platform,
                        const char *backup_user, const char *title,
                        const char *version) {
@@ -118,6 +172,7 @@ static void scan_slots(catalog_t *c, int title_fd, const char *platform,
   if (dup_fd < 0) return;
   DIR *slots = fdopendir(dup_fd);
   if (!slots) { close(dup_fd); return; }
+  target_list_t targets = load_targets(c, platform, title);
   const struct dirent *s;
   while ((s = readdir(slots)) != NULL && !c->truncated) {
     if (!safe_name(s->d_name) ||
@@ -127,9 +182,11 @@ static void scan_slots(catalog_t *c, int title_fd, const char *platform,
     bool valid = strcmp(version, "latest") != 0 || valid_stamp(slotfd);
     close(slotfd);
     if (valid)
-      match_targets(c, platform, backup_user, title, s->d_name, version);
+      append_slot(c, &targets, platform, backup_user, title, s->d_name, version);
   }
   closedir(slots);
+  c->truncated = c->truncated || targets.truncated;
+  free(targets.images);
 }
 static void scan_titles(catalog_t *c, int user_fd, const char *platform,
                         const char *backup_user, const char *version) {
@@ -196,8 +253,12 @@ struct json_object *sm_ps5save_catalog(const char *user) {
     return NULL;
   }
   char selected[9] = {0};
+  char foreground[9] = {0};
+  char requested[9] = {0};
   bool valid_user = user && hex_name(user, 8, 8);
-  if (valid_user) snprintf(selected, sizeof selected, "%s", user);
+  int foreground_id = 0;
+  if (sceUserServiceGetForegroundUser(&foreground_id) == 0)
+    snprintf(foreground, sizeof foreground, "%08x", (unsigned int)foreground_id);
   int homes = directory("/user/home");
   if (homes >= 0) {
     DIR *dir = fdopendir(homes);
@@ -206,13 +267,26 @@ struct json_object *sm_ps5save_catalog(const char *user) {
       while ((e = readdir(dir)) != NULL) {
         if (hex_name(e->d_name, 8, 8) &&
             is_directory_at(homes, e->d_name)) {
-          json_object_array_add(users, json_object_new_string(e->d_name));
-          if (!selected[0]) snprintf(selected, sizeof(selected), "%s", e->d_name);
+          struct json_object *profile = json_object_new_object();
+          if (!profile) continue;
+          char name[64] = {0};
+          int user_id = (int)strtoul(e->d_name, NULL, 16);
+          if (sceUserServiceGetUserName(user_id, name, sizeof name) != 0)
+            name[0] = '\0';
+          name[sizeof name - 1] = '\0';
+          json_object_object_add(profile, "id", json_object_new_string(e->d_name));
+          json_object_object_add(profile, "name", json_object_new_string(name));
+          json_object_array_add(users, profile);
+          if (!selected[0] || !strcmp(foreground, e->d_name))
+            snprintf(selected, sizeof selected, "%s", e->d_name);
+          if (valid_user && !strcmp(user, e->d_name))
+            snprintf(requested, sizeof requested, "%s", e->d_name);
         }
       }
       closedir(dir);
     } else close(homes);
   }
+  if (requested[0]) memcpy(selected, requested, sizeof selected);
   catalog_t c = {.items = items, .selected_user = selected,
                  .count = 0, .truncated = false};
   int volume = open(SM_PS5SAVE_VOLUME, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
@@ -223,7 +297,7 @@ struct json_object *sm_ps5save_catalog(const char *user) {
         strcmp(st.f_mntonname, SM_PS5SAVE_VOLUME) == 0;
     close(volume);
   }
-  if (mounted && selected[0]) {
+  if (mounted) {
     scan_version(&c, "latest");
     int dfd = directory(SM_PS5SAVE_VOLUME "/PS5Save/backup_daily");
     if (dfd >= 0) {
@@ -238,7 +312,7 @@ struct json_object *sm_ps5save_catalog(const char *user) {
       } else close(dfd);
     }
   }
-  json_object_object_add(root, "ok", json_object_new_boolean(true));
+  json_object_object_add(root, "status", json_object_new_int(0));
   json_object_object_add(root, "mounted", json_object_new_boolean(mounted));
   json_object_object_add(root, "selected_user", json_object_new_string(selected));
   json_object_object_add(root, "users", users);

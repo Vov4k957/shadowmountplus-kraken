@@ -32,6 +32,7 @@
 #include "sm_limits.h"
 #include "sm_mdbg.h"
 #include "sm_paths.h"
+#include "sm_ps5save_backup.h"
 
 #ifndef SHADOWMOUNT_VERSION
 #define SHADOWMOUNT_VERSION "unknown"
@@ -687,6 +688,8 @@ int main(void) {
     goto shutdown;
   }
   log_debug("[STARTUP] scanner startup sync done");
+  if (!sm_ps5save_backup_start())
+    log_debug("  [SAVES] backup worker could not start");
   if (!sm_api_service_start())
     log_debug("  [API] HTTP/JSON service unavailable: %s", strerror(errno));
   sm_scanner_run_loop();
@@ -694,6 +697,7 @@ int main(void) {
 shutdown:
   sm_ampr_updater_stop();
   sm_api_service_stop();
+  sm_ps5save_backup_stop();
   // Stop ShellCore producers before their lifecycle and mount-state owners.
   sm_shellcore_flags_stop();
   sm_shellcore_hooks_stop();

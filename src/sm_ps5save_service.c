@@ -11,9 +11,11 @@
 #include "sm_platform.h"
 #include "sm_ps5save_restore.h"
 #include "sm_game_lifecycle.h"
+#include "sm_filesystem.h"
 #include "sm_shellcore_service.h"
 #include "sm_runtime.h"
 #include "sm_log.h"
+#include "sm_storage.h"
 #include <pthread.h>
 #include <dirent.h>
 #include <sys/mount.h>
@@ -21,7 +23,6 @@
 #define SMP_SAVE_ROOT "/data/shadowmount/save_restore"
 #define SMP_SAVE_WORK SMP_SAVE_ROOT "/work"
 #define SMP_SAVE_MOUNT SMP_SAVE_ROOT "/mount"
-#define SMP_SAVE_BACKUP "PS5Save/smp_before_restore"
 #define SMP_BUF_SIZE (256u * 1024u)
 
 typedef struct { uint8_t reserved; char *budgetid; } SceFsMountSaveDataOpt;
@@ -57,9 +58,16 @@ static int mounted_volume(void) {
 }
 static int busy_mountpoint(void) {
   struct stat mount, parent;
-  if (stat(SMP_SAVE_MOUNT, &mount) != 0 ||
+  if (lstat(SMP_SAVE_MOUNT, &mount) != 0 || !S_ISDIR(mount.st_mode) ||
       stat(SMP_SAVE_ROOT, &parent) != 0) return 1;
-  return mount.st_dev != parent.st_dev;
+  if (mount.st_dev != parent.st_dev) return 1;
+  struct statfs *table = NULL;
+  int count = sm_mount_table_snapshot(&table);
+  bool busy = count < 0;
+  for (int i = 0; i < count && !busy; i++)
+    busy = strcmp(table[i].f_mntonname, SMP_SAVE_MOUNT) == 0;
+  free(table);
+  return busy;
 }
 static int unchanged(const struct stat *a, const struct stat *b) {
 #if defined(__FreeBSD__) || defined(__APPLE__)
@@ -127,13 +135,19 @@ static int image_key(const char *image, const char *ps4_key,
   if (pfsmgr < 0) { free(data); return -1; }
   int rc = ioctl(pfsmgr, 0xc0845302, data);
   close(pfsmgr);
-  if (rc == 0) memcpy(key, data + 0x60, 32);
+  if (rc >= 0) memcpy(key, data + 0x60, 32);
   memset(data, 0, 0x100);
   free(data);
-  return rc == 0 ? 0 : -1;
+  return rc >= 0 ? 0 : -1;
 }
 static int mount_staged(const char *image, const char *key_path, bool ps4) {
   uint8_t key[32] = {0};
+  unsigned char format;
+  int image_fd = open(image, O_RDONLY | O_NOFOLLOW);
+  if (image_fd < 0) return -1;
+  ssize_t n = pread(image_fd, &format, sizeof format, 0);
+  close(image_fd);
+  if (n != sizeof format || (format == 0x01) != ps4) return -1;
   if (image_key(image, key_path, ps4, key) != 0) return -1;
   SceFsMountSaveDataOpt opt = {0};
   if (sceFsInitMountSaveDataOpt(&opt) < 0) {
@@ -176,41 +190,71 @@ static int ps4_key_path(const char *image, char *out, size_t cap) {
   int n = snprintf(out, cap, "%.*s/%s.bin", (int)parent, image, base + 7);
   return n > 0 && (size_t)n < cap ? 0 : -1;
 }
-static int backup_current(int volume, const sm_ps5save_request_t *r,
-                          const char *image, const char *key,
-                          char *backup_out, size_t cap) {
-  char home[512], user[512], title[512];
-  snprintf(home, sizeof home, "%s/" SMP_SAVE_BACKUP, SM_PS5SAVE_VOLUME);
-  snprintf(user, sizeof user, "%s/%s", home, r->user);
+int sceKernelConvertUtcToLocaltime(time_t utc, time_t *local, void *timezone,
+                                  void *dst);
+
+/* Keep the same on-disk layout as PS5Upload's automatic safety copy. */
+static int backup_current(const sm_ps5save_request_t *r, char *backup, size_t cap) {
+  static const char *const kinds[] = {
+    "savedata_prospero", "savedata_prospero_meta", "savedata", "savedata_meta"
+  };
+  char user[128], title[150], stage[180];
+  snprintf(user, sizeof user, SM_PS5SAVE_ROLLBACK "/%s", r->user);
   snprintf(title, sizeof title, "%s/%s", user, r->title_id);
-  /* Reverify that volume has not been detached before writing. */
-  struct stat fs;
-  if (fstat(volume, &fs) != 0 ||
-      ensure_dir(home) || ensure_dir(user) || ensure_dir(title)) return -1;
-  time_t when = time(NULL);
-  char snapshot[700];
-  int n = snprintf(snapshot, sizeof snapshot, "%s/%lld-%ld", title,
-                   (long long)when, (long)getpid());
-  if (n <= 0 || (size_t)n >= sizeof snapshot ||
-      mkdir(snapshot, 0700) != 0) return -1;
-  n = snprintf(backup_out, cap, "%s/%s", snapshot, r->image);
-  if (n <= 0 || (size_t)n >= cap || copy_exclusive(image, backup_out)) return -1;
-  if (key) {
-    char to_key[1100];
-    if (ps4_key_path(backup_out, to_key, sizeof to_key) != 0 ||
-        copy_exclusive(key, to_key) != 0) return -1;
+  snprintf(stage, sizeof stage, "%s/.restore-XXXXXX", title);
+  if (ensure_dir("/data/ps5upload") || ensure_dir(SM_PS5SAVE_ROLLBACK) ||
+      ensure_dir(user) || ensure_dir(title) || !mkdtemp(stage))
+    return -1;
+  bool copied_save = false;
+  for (size_t i = 0; i < sizeof kinds / sizeof *kinds; i++) {
+    const bool meta = i == 1 || i == 3;
+    char src[160], dest[220];
+    snprintf(src, sizeof src, "/user/home/%s/%s%s/%s", r->user, kinds[i],
+             meta ? "/user" : "", r->title_id);
+    struct stat info;
+    if (lstat(src, &info) != 0) {
+      if (errno == ENOENT) continue;
+      goto failed;
+    }
+    snprintf(dest, sizeof dest, "%s/%s", stage, kinds[i]);
+    if (!S_ISDIR(info.st_mode) || sm_storage_copy_path(src, dest) != 0)
+      goto failed;
+    if (!meta) copied_save = true;
   }
-  return 0;
+  if (!copied_save) goto failed;
+  time_t local, now = time(NULL);
+  if (sceKernelConvertUtcToLocaltime(now, &local, NULL, NULL) != 0) local = now;
+  for (int retry = 0; retry < 60; retry++, local++) {
+    char stamp[32];
+    struct tm calendar;
+    if (!gmtime_r(&local, &calendar) ||
+        !strftime(stamp, sizeof stamp, "%Y-%m-%d_%H-%M-%S_auto", &calendar))
+      break;
+    int n = snprintf(backup, cap, "%s/%s", title, stamp);
+    if (n < 0 || (size_t)n >= cap) break;
+    if (rename(stage, backup) == 0) {
+      sync();
+      return 0;
+    }
+    if (errno != EEXIST && errno != ENOTEMPTY) break;
+  }
+failed:
+  (void)sm_storage_delete_path(stage);
+  backup[0] = '\0';
+  return -1;
 }
-int sm_ps5save_restore(const sm_ps5save_request_t *r, const char **reason) {
+int sm_ps5save_restore(const sm_ps5save_request_t *r, const char **reason,
+                       char *backup, size_t backup_size) {
   const char *why = "unknown_error";
-  char image[1024], key[1024] = {0}, backup[1100] = {0};
+  char image[1024], key[1024] = {0};
   char work[1024] = {0}, work_key[1024] = {0}, temp[1100] = {0};
   int volume = -1, slot = -1, fd = -1;
-  bool mounted = false;
+  bool mounted = false, staged = false, staged_key = false, temp_created = false;
   bool ps4 = r && strcmp(r->platform, "ps4") == 0;
   int rc = -1;
   if (reason) *reason = "invalid_request";
+  if (!backup || !backup_size) return -1;
+  backup[0] = '\0';
   if (sm_ps5save_restore_image(r, image, sizeof image) != 0) return -1;
   if (pthread_mutex_trylock(&restore_lock) != 0) {
     if (reason) *reason = "restore_busy";
@@ -233,18 +277,25 @@ int sm_ps5save_restore(const sm_ps5save_request_t *r, const char **reason) {
     why = "mount_busy_or_orphaned"; goto done;
   }
   /* Critical: never modify live save without a separately fsynced backup. */
-  if (backup_current(volume, r, image, ps4 ? key : NULL,
-                     backup, sizeof backup) != 0) {
+  if (backup_current(r, backup, backup_size) != 0) {
     why = "pre_restore_backup_failed"; goto done;
   }
   snprintf(work, sizeof work, SMP_SAVE_WORK "/%s", r->image);
   if (copy_exclusive(image, work) != 0) {
     why = "staging_failed_or_stale_file"; goto done;
   }
+  staged = true;
+  if (chmod(work, 0755) != 0) {
+    why = "staging_permissions_failed"; goto done;
+  }
   if (ps4) {
     if (ps4_key_path(work, work_key, sizeof work_key) != 0 ||
         copy_exclusive(key, work_key) != 0) {
       why = "staging_key_failed"; goto done;
+    }
+    staged_key = true;
+    if (chmod(work_key, 0755) != 0) {
+      why = "staging_permissions_failed"; goto done;
     }
   }
   if (mount_staged(work, work_key, ps4) != 0) {
@@ -274,6 +325,10 @@ int sm_ps5save_restore(const sm_ps5save_request_t *r, const char **reason) {
       copy_exclusive(work, temp) != 0) {
     why = "writeback_stage_failed"; goto done;
   }
+  temp_created = true;
+  if (chmod(temp, before.st_mode & 07777) != 0) {
+    why = "writeback_stage_failed"; goto done;
+  }
   if (game_busy(r->title_id) || lstat(image, &after) != 0 ||
       !unchanged(&before, &after)) {
     why = "target_changed_before_rename"; goto done;
@@ -281,7 +336,7 @@ int sm_ps5save_restore(const sm_ps5save_request_t *r, const char **reason) {
   if (rename(temp, image) != 0) {
     why = "atomic_replace_failed"; goto done;
   }
-  temp[0] = '\0';
+  temp_created = false;
   rc = 0;
   why = "ok";
 done:
@@ -291,21 +346,19 @@ done:
     if (unmount_staged() != 0) {
       why = "unmount_failed_staging_preserved";
       /* Never unlink a file still used by the mounted filesystem. */
-      work[0] = '\0';
-      work_key[0] = '\0';
+      staged = staged_key = false;
     } else mounted = false;
   }
-  if (temp[0]) unlink(temp);
+  if (temp_created) unlink(temp);
   /* Sony can fail a mount *after* attaching a volume. Never unlink its
    * backing file if the mount point is still occupied. */
-  if (work[0] && busy_mountpoint()) {
+  if (staged && busy_mountpoint()) {
     why = "mount_orphan_staging_preserved";
-    work[0] = ' ';
-    work_key[0] = ' ';
+    staged = staged_key = false;
     rc = -1;
   }
-  if (work_key[0]) unlink(work_key);
-  if (work[0]) unlink(work);
+  if (staged_key) unlink(work_key);
+  if (staged) unlink(work);
   if (slot >= 0) close(slot);
   if (volume >= 0) close(volume);
   pthread_mutex_unlock(&restore_lock);
