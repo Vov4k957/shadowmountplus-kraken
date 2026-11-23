@@ -54,8 +54,9 @@ static int
 open_backup_dir(const char *path) {
   int fd = sm_ps5save_open_dir(g_backup_directory, path);
   if(fd >= 0 && !same_backup_volume(fd)) {
+    int error = errno;
     close(fd);
-    errno = EXDEV;
+    errno = error;
     return -1;
   }
   return fd;

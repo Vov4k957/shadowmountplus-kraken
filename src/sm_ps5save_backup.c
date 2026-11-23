@@ -1978,17 +1978,23 @@ on_mounted_ssd(int fd) {
 
 static bool
 same_backup_volume(int fd) {
-#ifndef BACKUP_HOST_TEST
   struct statfs root, child;
-  if(fstatfs(g_backup_directory, &root) || fstatfs(fd, &child)) return false;
-  if(!memcmp(&root.f_fsid, &child.f_fsid, sizeof root.f_fsid)) return true;
-#else
-  struct stat root, child;
-  if(fstat(g_backup_directory, &root) || fstat(fd, &child)) return false;
-  if(root.st_dev == child.st_dev) return true;
-#endif
-  errno = EXDEV;
-  return false;
+  bool same;
+  if(!fstatfs(g_backup_directory, &root) && !fstatfs(fd, &child)) {
+    same = !memcmp(&root.f_fsid, &child.f_fsid, sizeof root.f_fsid);
+  } else if(errno == EPERM) {
+    /* The root has already passed the mounted-SSD check. The console can
+     * allow opening a directory while denying its filesystem query. */
+    struct stat root_stat, child_stat;
+    if(fstat(g_backup_directory, &root_stat) || fstat(fd, &child_stat)) return false;
+    same = root_stat.st_dev == child_stat.st_dev;
+    if(same && !seen_before("m2:fstatfs-denied"))
+      logq("M.2 directory verified using its device ID after fstatfs returned EPERM");
+  } else {
+    return false;
+  }
+  if(!same) errno = EXDEV;
+  return same;
 }
 
 /* Keep the standalone utility's loopback lease. Never contact the listener:
