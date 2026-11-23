@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
-  <meta name="shadowmount-saves" content="4">
+  <meta name="shadowmount-saves" content="5">
   <title>ShadowMount+ Library</title>
   <link rel="icon" type="image/png" sizes="512x512" href="/favicon.png">
   <style>
@@ -3230,6 +3230,9 @@
         savesBackupPaused: "Automatic backups paused.",
         savesBackupNoM2: "A writable M.2 is unavailable.",
         savesBackupNoConfig: "The backup configuration is missing from /mnt/ext1/PS5Save/backup.conf.",
+        savesBackupConfigError: "Could not read the backup configuration. See the SM+ log.",
+        savesBackupStorageError: "Could not prepare the backup folder on M.2. See the SM+ log.",
+        savesBackupServiceError: "Could not start the backup pass. See the SM+ log.",
         savesBackupStandalone: "The standalone backup payload is running. Stop it before starting an integrated backup.",
         savesBackupFailed: "Backup incomplete. See the SM+ log for details.",
         savesBackupUnavailable: "Backup worker unavailable.",
@@ -3280,6 +3283,9 @@
         savesBackupPaused: "Автоматическое копирование приостановлено.",
         savesBackupNoM2: "Диск M.2 недоступен для записи.",
         savesBackupNoConfig: "Файл настроек /mnt/ext1/PS5Save/backup.conf не найден.",
+        savesBackupConfigError: "Не удалось прочитать настройки бэкапа. Подробности в журнале SM+.",
+        savesBackupStorageError: "Не удалось подготовить папку копий на M.2. Подробности в журнале SM+.",
+        savesBackupServiceError: "Не удалось запустить копирование. Подробности в журнале SM+.",
         savesBackupStandalone: "Запущена отдельная нагрузка резервного копирования. Останови её перед запуском встроенной.",
         savesBackupFailed: "Копирование завершилось с ошибками. Подробности в журнале SM+.",
         savesBackupUnavailable: "Служба резервного копирования недоступна.",
@@ -5157,6 +5163,8 @@
         waiting: "savesBackupWaiting", ready: "savesBackupReady",
         queued: "savesBackupQueued", running: "savesBackupRunning",
         no_m2: "savesBackupNoM2", no_config: "savesBackupNoConfig",
+        storage_error: "savesBackupStorageError", config_error: "savesBackupConfigError",
+        service_error: "savesBackupServiceError",
         standalone_running: "savesBackupStandalone", backup_error: "savesBackupFailed",
         unavailable: "savesBackupUnavailable"
       };
@@ -5190,7 +5198,8 @@
         const paused = backup && !backup.enabled && !backup.busy &&
           ["waiting", "ready"].includes(backup.state);
         status.classList.toggle("saves-error", Boolean(saves.backupError) ||
-          ["no_m2", "no_config", "standalone_running", "backup_error", "unavailable"].includes(backup?.state));
+          ["no_m2", "no_config", "standalone_running", "unavailable"].includes(backup?.state) ||
+          Boolean(backup?.state?.endsWith("_error")));
         const message = paused ? t("savesBackupPaused") : backup?.state === "ready"
           ? "" : t(backupStatusKeys[backup?.state] || "savesBackupWaiting");
         status.textContent = saves.backupError || message;

@@ -1824,7 +1824,10 @@ read_backup_config(FILE *file, backup_stats_t *stats) {
   g_trophies = 1;
   while(!interrupted() && fgets(line, sizeof line, file))
     backup_entry(line, stats);
-  return ferror(file) ? -1 : 0;
+  if(!ferror(file)) return 0;
+  int error = errno ? errno : EIO;
+  logq("Cannot read " CONF_PATH ": %s (errno %d)", strerror(error), error);
+  return -1;
 }
 
 static void
@@ -1897,7 +1900,12 @@ run_cycle(FILE *f, int pending_only) {
   g_progress_planning = 0;
 
   memset(&stats, 0, sizeof stats);
-  if(rc || fseek(f, 0, SEEK_SET) || read_backup_config(f, &stats)) {
+  if(!rc && fseek(f, 0, SEEK_SET)) {
+    int error = errno ? errno : EIO;
+    logq("Cannot rewind " CONF_PATH ": %s (errno %d)", strerror(error), error);
+    rc = -1;
+  }
+  if(rc || read_backup_config(f, &stats)) {
     stats.failed++;
   } else {
     pending_disable();
@@ -1958,25 +1966,37 @@ static bool
 same_backup_volume(int fd) {
 #ifndef BACKUP_HOST_TEST
   struct statfs root, child;
-  return fstatfs(g_backup_directory, &root) == 0 && fstatfs(fd, &child) == 0 &&
-      memcmp(&root.f_fsid, &child.f_fsid, sizeof root.f_fsid) == 0;
+  if(fstatfs(g_backup_directory, &root) || fstatfs(fd, &child)) return false;
+  if(!memcmp(&root.f_fsid, &child.f_fsid, sizeof root.f_fsid)) return true;
 #else
   struct stat root, child;
-  return fstat(g_backup_directory, &root) == 0 && fstat(fd, &child) == 0 &&
-      root.st_dev == child.st_dev;
+  if(fstat(g_backup_directory, &root) || fstat(fd, &child)) return false;
+  if(root.st_dev == child.st_dev) return true;
 #endif
+  errno = EXDEV;
+  return false;
 }
 
-static int
-backup_subdir_available(const char *path) {
-  struct stat st;
-  if(fstatat(g_backup_directory, path, &st, AT_SYMLINK_NOFOLLOW)) return errno == ENOENT;
-  if(!S_ISDIR(st.st_mode)) return 0;
-  int fd = openat(g_backup_directory, path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
-  if(fd < 0) return 0;
-  bool on_ssd = same_backup_volume(fd);
-  close(fd);
-  return on_ssd;
+static bool
+prepare_backup_subdir(const char *path) {
+  /* The history directory normally does not exist when upgrading. Create
+   * it on the verified SSD before scanning or pruning any game versions. */
+  int error = 0;
+  if(mkdirat(g_backup_directory, path, 0777) && errno != EEXIST) {
+    error = errno ? errno : EIO;
+  } else {
+    int fd = openat(g_backup_directory, path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    if(fd < 0) {
+      error = errno ? errno : EIO;
+    } else {
+      if(!same_backup_volume(fd)) error = errno ? errno : EIO;
+      close(fd);
+    }
+  }
+  if(error)
+    logq("Cannot prepare " M2_MOUNT "/" M2_BACKUP_DIR "/%s: %s (errno %d)",
+         path, strerror(error), error);
+  return error == 0;
 }
 
 /* Keep the standalone utility's loopback lease. Never contact the listener:
@@ -2042,14 +2062,19 @@ run_m2_backup(bool pending_only, bool maintenance_only, bool *prepared, bool *co
   g_backup_directory = open_backup_root();
   if(g_backup_directory < 0) {
     *prepared = *configured = false;
-    return errno == ENODEV ? "no_m2" : "no_config";
+    int error = errno;
+    if(error == ENODEV) return "no_m2";
+    if(error == ENOENT) return "no_config";
+    logq("Cannot open " M2_MOUNT "/" M2_BACKUP_DIR ": %s (errno %d)",
+         strerror(error), error);
+    return "storage_error";
   }
-  const char *outcome = "no_config";
-  if(backup_subdir_available(BACKUP_ROOT) &&
-     backup_subdir_available(SM_PS5SAVE_VERSIONS)) {
+  const char *outcome;
+  if(!*prepared) load_last_copy();
+  if(prepare_backup_subdir(BACKUP_ROOT) &&
+     prepare_backup_subdir(SM_PS5SAVE_VERSIONS)) {
     bool cleanup_error = false;
     if(!*prepared) {
-      load_last_copy();
       cleanup_error = prune_all_versions() != 0;
       *prepared = !cleanup_error && !interrupted();
       if(cleanup_error && !interrupted()) logq("Old save versions could not be pruned");
@@ -2060,12 +2085,27 @@ run_m2_backup(bool pending_only, bool maintenance_only, bool *prepared, bool *co
     if(file) {
       int result = maintenance_only ? read_backup_config(file, NULL)
                                     : run_cycle(file, pending_only);
-      if(fclose(file)) result = -1;
-      outcome = interrupted() ? "waiting" : result || cleanup_error ? "backup_error" : "ready";
+      if(fclose(file)) {
+        int error = errno;
+        logq("Cannot close " CONF_PATH ": %s (errno %d)", strerror(error), error);
+        outcome = "config_error";
+      } else if(interrupted()) {
+        outcome = "waiting";
+      } else if(maintenance_only && result) {
+        outcome = "config_error";
+      } else {
+        outcome = result || cleanup_error ? "backup_error" : "ready";
+      }
+    } else {
+      int error = errno;
+      outcome = error == ENOENT ? "no_config" : "config_error";
+      if(error != ENOENT)
+        logq("Cannot open " M2_MOUNT "/" M2_BACKUP_DIR "/" CONF_PATH
+             ": %s (errno %d)", strerror(error), error);
     }
   } else {
-    *configured = false;
-    outcome = "backup_error";
+    *prepared = *configured = false;
+    outcome = "storage_error";
   }
   close(g_backup_directory);
   g_backup_directory = -1;
@@ -2137,10 +2177,16 @@ backup_worker(void *unused) {
     pthread_mutex_unlock(&g_status_lock);
 
     int lease = reserve_ps5save_port();
-    const char *outcome = lease >= 0
-        ? run_m2_backup(pending, !scheduled && !manual, &prepared, &configured) :
-        errno == EADDRINUSE ? "standalone_running" : "backup_error";
-    if(lease >= 0) close(lease);
+    const char *outcome;
+    if(lease >= 0) {
+      outcome = run_m2_backup(pending, !scheduled && !manual, &prepared, &configured);
+      close(lease);
+    } else {
+      int error = errno;
+      outcome = error == EADDRINUSE ? "standalone_running" : "service_error";
+      if(error != EADDRINUSE)
+        logq("Cannot acquire the save backup lock: %s (errno %d)", strerror(error), error);
+    }
     pthread_mutex_unlock(&g_save_io_lock);
 
     pthread_mutex_lock(&g_status_lock);
@@ -2154,8 +2200,7 @@ backup_worker(void *unused) {
       g_backup_status.ps5 = g_ps5saves != 0;
       g_backup_status.trophies = g_trophies != 0;
     }
-    if(!configured || strcmp(outcome, "standalone_running") == 0 ||
-       strcmp(outcome, "waiting") == 0) {
+    if(!configured || lease < 0 || strcmp(outcome, "waiting") == 0) {
       pending_retry_after = started + SLICE_SEC * 3;
       due = pending_retry_after;
     } else {
