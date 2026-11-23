@@ -191,6 +191,7 @@ typedef enum { SV_OK, SV_SKIP, SV_FAILED, SV_GAME } sv_result_t;
 
 static char *g_buf;
 static int g_backup_directory = -1;
+static int g_backup_volume = -1;
 static atomic_bool g_stopping = false;
 static pthread_mutex_t g_status_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_save_io_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -404,7 +405,7 @@ fs_free(const char *path, const char *test_env) {
   (void)test_env;
 #endif
 
-  if((path ? statfs(path, &sf) : fstatfs(g_backup_directory, &sf)) ||
+  if((path ? statfs(path, &sf) : fstatfs(g_backup_volume, &sf)) ||
      (int64_t)sf.f_bavail <= 0) {
     return 0;
   }
@@ -2031,6 +2032,8 @@ run_cycle(FILE *f, int pending_only) {
   }
   g_progress_planning = 0;
   if(fseek(f, 0, SEEK_SET)) {
+    int error = errno ? errno : EIO;
+    logq("Cannot rewind " CONF_PATH " (%s, errno %d)", strerror(error), error);
     fclose(f);
     return -1;
   }
@@ -2088,38 +2091,41 @@ static int
 on_mounted_ssd(int fd) {
 #ifndef BACKUP_HOST_TEST
   struct statfs fs;
-  return fstatfs(fd, &fs) == 0 &&
-         !strncmp(fs.f_mntonname, M2_MOUNT, sizeof fs.f_mntonname) &&
-         !(fs.f_flags & MNT_RDONLY);
+  if(fstatfs(fd, &fs)) return 0;
+  if(strncmp(fs.f_mntonname, M2_MOUNT, sizeof fs.f_mntonname)) {
+    errno = ENODEV;
+    return 0;
+  }
+  if(!(fs.f_flags & MNT_RDONLY)) return 1;
 #else
   struct statvfs fs;
-  return fstatvfs(fd, &fs) == 0 && !(fs.f_flag & ST_RDONLY);
+  if(fstatvfs(fd, &fs)) return 0;
+  if(!(fs.f_flag & ST_RDONLY)) return 1;
 #endif
+  errno = EROFS;
+  return 0;
 }
 
 static bool
-same_backup_volume(int fd) {
-#ifndef BACKUP_HOST_TEST
-  struct statfs root, child;
-  return fstatfs(g_backup_directory, &root) == 0 && fstatfs(fd, &child) == 0 &&
-      memcmp(&root.f_fsid, &child.f_fsid, sizeof root.f_fsid) == 0;
-#else
-  struct stat root, child;
-  return fstat(g_backup_directory, &root) == 0 && fstat(fd, &child) == 0 &&
-      root.st_dev == child.st_dev;
-#endif
+verify_backup_device(int fd, dev_t device) {
+  struct stat st;
+  if(fstat(fd, &st)) return false;
+  if(st.st_dev == device) return true;
+  errno = EXDEV;
+  return false;
 }
 
 static int
-backup_subdir_available(const char *path) {
-  struct stat st;
-  if(fstatat(g_backup_directory, path, &st, AT_SYMLINK_NOFOLLOW)) return errno == ENOENT;
-  if(!S_ISDIR(st.st_mode)) return 0;
+backup_subdir_available(const char *path, dev_t device) {
   int fd = openat(g_backup_directory, path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
-  if(fd < 0) return 0;
-  bool on_ssd = same_backup_volume(fd);
-  close(fd);
-  return on_ssd;
+  if(fd < 0 && errno == ENOENT) return 1;
+  const bool valid = fd >= 0 && verify_backup_device(fd, device);
+  const int error = errno;
+  if(fd >= 0) close(fd);
+  if(!valid)
+    logq("Cannot use M.2 backup directory %s (%s, errno %d)", path,
+         strerror(error), error);
+  return valid;
 }
 
 /* Keep the standalone utility's loopback lease. Never contact the listener:
@@ -2146,34 +2152,63 @@ reserve_ps5save_port(void) {
 static const char *
 run_m2_backup(bool pending_only) {
   int volume = open(M2_MOUNT, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
-  if(volume < 0) return "no_m2";
-  if(!on_mounted_ssd(volume)) {
-    close(volume);
+  if(volume < 0 || !on_mounted_ssd(volume)) {
+    int error = errno;
+    if(volume >= 0) close(volume);
+    logq("Cannot use writable M.2 at " M2_MOUNT " (%s, errno %d)",
+         strerror(error), error);
     return "no_m2";
+  }
+  struct stat mounted;
+  if(fstat(volume, &mounted)) {
+    logq("Cannot identify the mounted M.2 device (%s)", strerror(errno));
+    close(volume);
+    return "backup_error";
   }
   g_backup_directory = openat(volume, M2_BACKUP_DIR,
                               O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
-  close(volume);
-  if(g_backup_directory < 0) return "no_config";
+  if(g_backup_directory < 0) {
+    int error = errno;
+    close(volume);
+    logq("Cannot open " M2_BACKUP_DIR " on M.2 (%s, errno %d)", strerror(error), error);
+    return error == ENOENT ? "no_config" : "backup_error";
+  }
+  g_backup_volume = volume;
 
   const char *outcome = "no_config";
-  if(on_mounted_ssd(g_backup_directory) &&
-     backup_subdir_available(BACKUP_ROOT) &&
-     backup_subdir_available(DAILY_ROOT)) {
+  if(!verify_backup_device(g_backup_directory, mounted.st_dev)) {
+    logq("Cannot verify " M2_BACKUP_DIR " on the mounted M.2 (%s)", strerror(errno));
+    outcome = "backup_error";
+  } else if(backup_subdir_available(BACKUP_ROOT, mounted.st_dev) &&
+            backup_subdir_available(DAILY_ROOT, mounted.st_dev)) {
     int conf = openat(g_backup_directory, CONF_PATH,
                       O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
-    if(conf >= 0) {
+    if(conf < 0) {
+      int error = errno;
+      logq("Cannot open " CONF_PATH " on M.2 (%s, errno %d)", strerror(error), error);
+      outcome = error == ENOENT ? "no_config" : "backup_error";
+    } else {
       struct stat st;
-      FILE *file = fstat(conf, &st) == 0 && S_ISREG(st.st_mode)
-          ? fdopen(conf, "r") : NULL;
+      FILE *file = NULL;
+      if(!fstat(conf, &st)) {
+        if(S_ISREG(st.st_mode)) file = fdopen(conf, "r");
+        else errno = EINVAL;
+      }
       if(file) {
         int result = run_cycle(file, pending_only);
         outcome = interrupted() ? "waiting" : result ? "backup_error" : "ready";
-      } else close(conf);
+      } else {
+        int error = errno;
+        close(conf);
+        logq("Cannot read " CONF_PATH " on M.2 (%s, errno %d)", strerror(error), error);
+        outcome = "backup_error";
+      }
     }
   } else outcome = "backup_error";
   close(g_backup_directory);
+  close(g_backup_volume);
   g_backup_directory = -1;
+  g_backup_volume = -1;
   return outcome;
 }
 
@@ -2235,9 +2270,16 @@ backup_worker(void *unused) {
     pthread_mutex_unlock(&g_status_lock);
 
     int lease = reserve_ps5save_port();
-    const char *outcome = lease >= 0 ? run_m2_backup(pending) :
-        errno == EADDRINUSE ? "standalone_running" : "backup_error";
-    if(lease >= 0) close(lease);
+    const char *outcome;
+    if(lease >= 0) {
+      outcome = run_m2_backup(pending);
+      close(lease);
+    } else {
+      int error = errno;
+      outcome = error == EADDRINUSE ? "standalone_running" : "backup_error";
+      logq("Cannot acquire the backup worker lease on port %d (%s, errno %d)",
+           LOCK_PORT, strerror(error), error);
+    }
     pthread_mutex_unlock(&g_save_io_lock);
 
     pthread_mutex_lock(&g_status_lock);
@@ -2267,6 +2309,8 @@ sm_ps5save_backup_start(void) {
   struct stat paused;
   g_backup_status.enabled = lstat(BACKUP_PAUSE_FILE, &paused) != 0;
   g_backup_status.state = "waiting";
+  if(!g_backup_status.enabled)
+    logq("Automatic backup paused; manual passes are available");
   atomic_store(&g_stopping, false);
   g_buf = malloc(COPY_BUF_SZ);
   if(!g_buf) {
