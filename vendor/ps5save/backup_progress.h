@@ -1,4 +1,4 @@
-/* Cycle progress: one unit per changed file, save image or daily snapshot.
+/* Cycle progress: one unit per changed file or save image.
  * Save images split their unit between staging and decrypted-file copying.
  * Only this state is shared with the progress logger. */
 #ifndef BACKUP_PROGRESS_H

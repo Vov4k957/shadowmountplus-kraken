@@ -1,6 +1,6 @@
 /*
  * Read-only PS5Save M.2 catalog for the ShadowMountPlus web page.
- * Folder layout is preserved from the PS5Save program and PS5Upload fork:
+ * Reads the integrated per-game versions and the older PS5Save layout:
  * backup/saves/{ps5|ps4}/<backup-user>/<title>/<slot> and
  * backup_daily/YYYY-MM-DD/saves/...
  */
@@ -36,11 +36,6 @@ static int game_name(const char *name) {
       strspn(name, "ABCDEFGHIJKLMNOPQRSTUVWXYZ") == 4 &&
       strspn(name + 4, "0123456789") == 5;
 }
-static int date_name(const char *name) {
-  return strlen(name) == 10 && strspn(name, "0123456789") == 4 &&
-      name[4] == '-' && strspn(name + 5, "0123456789") == 2 &&
-      name[7] == '-' && strspn(name + 8, "0123456789") == 2;
-}
 static bool is_directory_at(int dir, const char *name) {
   struct stat st;
   return fstatat(dir, name, &st, AT_SYMLINK_NOFOLLOW) == 0 &&
@@ -51,17 +46,6 @@ static int directory_at(int fd, const char *name) {
 }
 static int directory(const char *path) {
   return open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
-}
-static bool valid_stamp(int slot) {
-  int fd = openat(slot, ".image_stamp", O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
-  if (fd < 0) return false;
-  struct stat st;
-  char magic[8];
-  bool ok = fstat(fd, &st) == 0 && S_ISREG(st.st_mode) &&
-      st.st_size == 64 && read(fd, magic, 8) == 8 &&
-      memcmp(magic, "PS5IMG2\n", 8) == 0;
-  close(fd);
-  return ok;
 }
 static void append_item(catalog_t *c, const char *platform,
                         const char *user, const char *backup_user,
@@ -179,7 +163,7 @@ static void scan_slots(catalog_t *c, int title_fd, const char *platform,
         !is_directory_at(title_fd, s->d_name)) continue;
     int slotfd = directory_at(title_fd, s->d_name);
     if (slotfd < 0) continue;
-    bool valid = strcmp(version, "latest") != 0 || valid_stamp(slotfd);
+    bool valid = sm_ps5save_legacy_date(version) || sm_ps5save_valid_stamp(slotfd);
     close(slotfd);
     if (valid)
       append_slot(c, &targets, platform, backup_user, title, s->d_name, version);
@@ -188,6 +172,25 @@ static void scan_slots(catalog_t *c, int title_fd, const char *platform,
   c->truncated = c->truncated || targets.truncated;
   free(targets.images);
 }
+
+static void scan_game_versions(catalog_t *c, int title_fd, const char *platform,
+                               const char *backup_user, const char *title) {
+  int fd = directory_at(title_fd, ".");
+  if (fd < 0) return;
+  DIR *versions = fdopendir(fd);
+  if (!versions) { close(fd); return; }
+  const struct dirent *e;
+  while ((e = readdir(versions)) != NULL && !c->truncated) {
+    if (!sm_ps5save_version_name(e->d_name)) continue;
+    int version_fd = directory_at(title_fd, e->d_name);
+    if (version_fd < 0) continue;
+    if (sm_ps5save_complete_version(version_fd))
+      scan_slots(c, version_fd, platform, backup_user, title, e->d_name);
+    close(version_fd);
+  }
+  closedir(versions);
+}
+
 static void scan_titles(catalog_t *c, int user_fd, const char *platform,
                         const char *backup_user, const char *version) {
   int dup_fd = dup(user_fd);
@@ -199,7 +202,8 @@ static void scan_titles(catalog_t *c, int user_fd, const char *platform,
     if (!game_name(e->d_name)) continue;
     int title_fd = directory_at(user_fd, e->d_name);
     if (title_fd >= 0) {
-      scan_slots(c, title_fd, platform, backup_user, e->d_name, version);
+      if (version) scan_slots(c, title_fd, platform, backup_user, e->d_name, version);
+      else scan_game_versions(c, title_fd, platform, backup_user, e->d_name);
       close(title_fd);
     }
   }
@@ -222,15 +226,17 @@ static void scan_users(catalog_t *c, int platform_fd,
   }
   closedir(users);
 }
-static void scan_version(catalog_t *c, const char *version) {
+static void scan_version(catalog_t *c, int volume, const char *version) {
   char path[512];
   int n;
-  if (!strcmp(version, "latest"))
-    n = snprintf(path, sizeof(path), SM_PS5SAVE_VOLUME "/PS5Save/backup/saves");
+  if (!version)
+    n = snprintf(path, sizeof(path), "PS5Save/" SM_PS5SAVE_VERSIONS);
+  else if (!strcmp(version, "latest"))
+    n = snprintf(path, sizeof(path), "PS5Save/backup/saves");
   else
-    n = snprintf(path, sizeof(path), SM_PS5SAVE_VOLUME "/PS5Save/backup_daily/%s/saves", version);
+    n = snprintf(path, sizeof(path), "PS5Save/backup_daily/%s/saves", version);
   if (n < 0 || (size_t)n >= sizeof(path)) return;
-  int saves = directory(path);
+  int saves = sm_ps5save_open_dir(volume, path);
   if (saves < 0) return;
   for (size_t i = 0; i < 2 && !c->truncated; ++i) {
     const char *platform = i == 0 ? "ps5" : "ps4";
@@ -295,23 +301,24 @@ struct json_object *sm_ps5save_catalog(const char *user) {
     struct statfs st;
     mounted = fstatfs(volume, &st) == 0 &&
         strcmp(st.f_mntonname, SM_PS5SAVE_VOLUME) == 0;
-    close(volume);
   }
   if (mounted) {
-    scan_version(&c, "latest");
-    int dfd = directory(SM_PS5SAVE_VOLUME "/PS5Save/backup_daily");
+    scan_version(&c, volume, NULL);
+    scan_version(&c, volume, "latest");
+    int dfd = sm_ps5save_open_dir(volume, "PS5Save/backup_daily");
     if (dfd >= 0) {
       DIR *dates = fdopendir(dfd);
       if (dates) {
         const struct dirent *e;
         while ((e = readdir(dates)) != NULL && !c.truncated) {
-          if (date_name(e->d_name) && is_directory_at(dfd, e->d_name))
-            scan_version(&c, e->d_name);
+          if (sm_ps5save_legacy_date(e->d_name) && is_directory_at(dfd, e->d_name))
+            scan_version(&c, volume, e->d_name);
         }
         closedir(dates);
       } else close(dfd);
     }
   }
+  if (volume >= 0) close(volume);
   json_object_object_add(root, "status", json_object_new_int(0));
   json_object_object_add(root, "mounted", json_object_new_boolean(mounted));
   json_object_object_add(root, "selected_user", json_object_new_string(selected));

@@ -104,6 +104,32 @@ int main(void) {
   check(stage,"progress.sav","older progress");
   assert(symlinkat("/etc/passwd",snapshot,"symlink")==0);
   assert(sm_ps5save_copy_slot(snapshot,stage,0)<0);
+
+  const char *versions = "PS5Save/" SM_PS5SAVE_VERSIONS "/ps5/000000aa/PPSA02100";
+  const char *version = "v1795400080000000";
+  char stored[256];
+  assert(snprintf(stored, sizeof stored, "%s/%s/Global", versions, version) < (int)sizeof stored);
+  dirs(root, stored);
+  int complete_slot = sm_ps5save_open_dir(root, stored);
+  assert(complete_slot >= 0);
+  put(complete_slot, ".image_stamp", stamp, sizeof stamp);
+  put(complete_slot, "progress.sav", "complete version", 16);
+  strcpy(req.version, version);
+  assert(sm_ps5save_open_slot(root, &req) < 0);
+  int complete = openat(complete_slot, "..", O_RDONLY | O_DIRECTORY);
+  assert(complete >= 0);
+  put(complete, SM_PS5SAVE_COMPLETE, SM_PS5SAVE_COMPLETE_MAGIC,
+      sizeof SM_PS5SAVE_COMPLETE_MAGIC - 1);
+  open_slot = sm_ps5save_open_slot(root, &req);
+  assert(open_slot >= 0);
+  assert(sm_ps5save_copy_slot(open_slot, stage, 0) == 0);
+  check(stage, "sce_sys/param.sfo", "new profile");
+  check(stage, "progress.sav", "complete version");
+  close(open_slot);
+  close(complete);
+  close(complete_slot);
+  strcpy(req.version, "../v000000000000");
+  assert(sm_ps5save_open_slot(root, &req) < 0);
   close(root);close(source);close(stage);close(snapshot);
   assert(nftw(tmp,rm,16,FTW_DEPTH|FTW_PHYS)==0);
   puts("SM+ PS5Save slot safety fixtures passed");
