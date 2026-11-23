@@ -373,9 +373,41 @@ wall_clock(void) {
 }
 
 
-/**
- * mkdir -p
- **/
+static bool same_backup_volume(int fd);
+
+/* Opening an existing directory requires no creation rights. Keep relative
+ * destinations on the SSD and reject symlinks in the backup path. */
+static int
+ensure_directory(const char *path) {
+  const bool on_m2 = path[0] != '/';
+  const int flags = O_RDONLY | O_DIRECTORY | (on_m2 ? O_NOFOLLOW : 0);
+  const char *operation = "open";
+  int fd = openat(g_backup_directory, path, flags);
+  if(fd < 0 && errno == ENOENT) {
+    operation = "create";
+    int rc = on_m2 ? mkdirat(g_backup_directory, path, 0777) : mkdir(path, 0777);
+    if(!rc || errno == EEXIST) {
+      operation = "open";
+      fd = openat(g_backup_directory, path, flags);
+    }
+  }
+  int error = fd < 0 ? errno : 0;
+  if(fd >= 0) {
+    operation = "verify volume";
+    if(on_m2 && !same_backup_volume(fd)) error = errno ? errno : EIO;
+    close(fd);
+  } else if(!error) {
+    error = EIO;
+  }
+  if(!error) return 0;
+  logq("Cannot prepare %s%s (%s): %s (errno %d)",
+       on_m2 ? M2_MOUNT "/" M2_BACKUP_DIR "/" : "",
+       path, operation, strerror(error), error);
+  errno = error;
+  return -1;
+}
+
+/** Create missing parent directories. */
 static int
 mkdir_p(const char *path) {
   char tmp[PATH_MAX];
@@ -389,27 +421,11 @@ mkdir_p(const char *path) {
   for(char *p = tmp + 1; *p; p++) {
     if(*p == '/') {
       *p = 0;
-      if(mkdirat(g_backup_directory, tmp, 0777) && errno != EEXIST) {
-        return -1;
-      }
-      if(tmp[0] != '/') {
-        int fd = openat(g_backup_directory, tmp, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
-        if(fd < 0) return -1;
-        close(fd);
-      }
+      if(ensure_directory(tmp)) return -1;
       *p = '/';
     }
   }
-
-  if(mkdirat(g_backup_directory, tmp, 0777) && errno != EEXIST) {
-    return -1;
-  }
-
-  if(tmp[0] == '/') return 0;
-  int fd = openat(g_backup_directory, tmp, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
-  if(fd < 0) return -1;
-  close(fd);
-  return 0;
+  return ensure_directory(tmp);
 }
 
 
@@ -960,8 +976,6 @@ cleanup_stale(void) {
   unlink(TMP_IMG);
 }
 
-
-static bool same_backup_volume(int fd);
 
 static int
 copy_version_file(const char *src, const char *dst, const struct stat *st) {
@@ -1977,28 +1991,6 @@ same_backup_volume(int fd) {
   return false;
 }
 
-static bool
-prepare_backup_subdir(const char *path) {
-  /* The history directory normally does not exist when upgrading. Create
-   * it on the verified SSD before scanning or pruning any game versions. */
-  int error = 0;
-  if(mkdirat(g_backup_directory, path, 0777) && errno != EEXIST) {
-    error = errno ? errno : EIO;
-  } else {
-    int fd = openat(g_backup_directory, path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
-    if(fd < 0) {
-      error = errno ? errno : EIO;
-    } else {
-      if(!same_backup_volume(fd)) error = errno ? errno : EIO;
-      close(fd);
-    }
-  }
-  if(error)
-    logq("Cannot prepare " M2_MOUNT "/" M2_BACKUP_DIR "/%s: %s (errno %d)",
-         path, strerror(error), error);
-  return error == 0;
-}
-
 /* Keep the standalone utility's loopback lease. Never contact the listener:
  * a connection is the standalone utility's command to stop. */
 static int
@@ -2071,25 +2063,23 @@ run_m2_backup(bool pending_only, bool maintenance_only, bool *prepared, bool *co
   }
   const char *outcome;
   if(!*prepared) load_last_copy();
-  if(prepare_backup_subdir(BACKUP_ROOT) &&
-     prepare_backup_subdir(SM_PS5SAVE_VERSIONS)) {
+  struct stat st;
+  FILE *file = open_backup_config(g_backup_directory, &st);
+  const int config_error = file ? 0 : errno;
+  *configured = file != NULL;
+  const bool folders_ready = !ensure_directory(BACKUP_ROOT) &&
+                             !ensure_directory(SM_PS5SAVE_VERSIONS);
+  if(folders_ready) {
     bool cleanup_error = false;
     if(!*prepared) {
       cleanup_error = prune_all_versions() != 0;
       *prepared = !cleanup_error && !interrupted();
       if(cleanup_error && !interrupted()) logq("Old save versions could not be pruned");
     }
-    struct stat st;
-    FILE *file = open_backup_config(g_backup_directory, &st);
-    *configured = file != NULL;
     if(file) {
       int result = maintenance_only ? read_backup_config(file, NULL)
                                     : run_cycle(file, pending_only);
-      if(fclose(file)) {
-        int error = errno;
-        logq("Cannot close " CONF_PATH ": %s (errno %d)", strerror(error), error);
-        outcome = "config_error";
-      } else if(interrupted()) {
+      if(interrupted()) {
         outcome = "waiting";
       } else if(maintenance_only && result) {
         outcome = "config_error";
@@ -2097,15 +2087,20 @@ run_m2_backup(bool pending_only, bool maintenance_only, bool *prepared, bool *co
         outcome = result || cleanup_error ? "backup_error" : "ready";
       }
     } else {
-      int error = errno;
-      outcome = error == ENOENT ? "no_config" : "config_error";
-      if(error != ENOENT)
+      outcome = config_error == ENOENT ? "no_config" : "config_error";
+      if(config_error != ENOENT)
         logq("Cannot open " M2_MOUNT "/" M2_BACKUP_DIR "/" CONF_PATH
-             ": %s (errno %d)", strerror(error), error);
+             ": %s (errno %d)", strerror(config_error), config_error);
     }
   } else {
-    *prepared = *configured = false;
+    *prepared = false;
+    if(file) (void)read_backup_config(file, NULL);
     outcome = "storage_error";
+  }
+  if(file && fclose(file)) {
+    int error = errno;
+    logq("Cannot close " CONF_PATH ": %s (errno %d)", strerror(error), error);
+    if(folders_ready && !interrupted()) outcome = "config_error";
   }
   close(g_backup_directory);
   g_backup_directory = -1;
@@ -2200,7 +2195,8 @@ backup_worker(void *unused) {
       g_backup_status.ps5 = g_ps5saves != 0;
       g_backup_status.trophies = g_trophies != 0;
     }
-    if(!configured || lease < 0 || strcmp(outcome, "waiting") == 0) {
+    if(!configured || lease < 0 || strcmp(outcome, "waiting") == 0 ||
+       strcmp(outcome, "storage_error") == 0) {
       pending_retry_after = started + SLICE_SEC * 3;
       due = pending_retry_after;
     } else {

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
-  <meta name="shadowmount-saves" content="5">
+  <meta name="shadowmount-saves" content="6">
   <title>ShadowMount+ Library</title>
   <link rel="icon" type="image/png" sizes="512x512" href="/favicon.png">
   <style>
@@ -576,8 +576,13 @@
     .save-actions, .save-filters { display: grid; gap: 10px; align-items: end; }
     .save-actions { grid-template-columns: minmax(0, 1fr) auto; }
     .save-controls { display: flex; gap: 10px; flex-wrap: wrap; align-items: end; }
-    .save-interval { display: grid; gap: 5px; }
-    .save-interval input { width: 8em; }
+    .save-interval { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 5px 6px; align-items: center; }
+    .save-interval label { grid-column: 1 / -1; }
+    .save-interval input { width: 7em; appearance: textfield; -webkit-appearance: textfield; }
+    .save-interval input::-webkit-inner-spin-button,
+    .save-interval input::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+    .save-interval-steps { display: grid; gap: 4px; }
+    .btn.save-interval-step { min-width: 42px; min-height: 34px; padding: 0; font-size: 19px; line-height: 1; }
     .save-filters { grid-template-columns: repeat(2, minmax(0, 1fr)) minmax(0, 1.5fr) auto; margin: 16px 0; }
     .save-filters label { display: grid; gap: 5px; min-width: 0; }
     .save-filters select, .save-filters input { width: 100%; min-width: 0; }
@@ -998,8 +1003,14 @@
               <span class="subtle save-schedule" id="savesContents"></span>
             </div>
             <div class="save-controls">
-              <label class="save-interval"><span class="subtle" data-i18n="savesInterval">Interval (min)</span>
-                <input type="number" id="savesInterval" min="1" max="1440" step="1" required disabled></label>
+              <div class="save-interval">
+                <label for="savesInterval" class="subtle" data-i18n="savesInterval">Interval (min)</label>
+                <input type="number" id="savesInterval" min="1" max="1440" step="1" required disabled>
+                <div class="save-interval-steps">
+                  <button class="btn save-interval-step" id="savesIntervalUp" type="button" aria-label="Increase interval by one minute" data-i18n-aria-label="savesIntervalUp" disabled>↑</button>
+                  <button class="btn save-interval-step" id="savesIntervalDown" type="button" aria-label="Decrease interval by one minute" data-i18n-aria-label="savesIntervalDown" disabled>↓</button>
+                </div>
+              </div>
               <button class="btn" id="savesRun" type="button" disabled data-i18n="savesRun">Back up now</button>
               <button class="btn primary" id="savesSave" type="button" disabled data-i18n="savesSave">Save</button>
             </div>
@@ -3216,6 +3227,8 @@
         savesAutomatic: "Automatic backups",
         savesRun: "Back up now",
         savesInterval: "Interval (min)",
+        savesIntervalUp: "Increase interval by one minute",
+        savesIntervalDown: "Decrease interval by one minute",
         savesSave: "Save",
         savesTrophies: "PS4 and PS5 trophies",
         savesLastCopy: "Last backup · {time} · {result}",
@@ -3269,6 +3282,8 @@
         savesAutomatic: "Автоматическое копирование",
         savesRun: "Скопировать сейчас",
         savesInterval: "Интервал, мин",
+        savesIntervalUp: "Увеличить интервал на минуту",
+        savesIntervalDown: "Уменьшить интервал на минуту",
         savesSave: "Сохранить",
         savesTrophies: "Трофеи PS4 и PS5",
         savesLastCopy: "Последнее копирование · {time} · {result}",
@@ -5180,8 +5195,13 @@
         const minutes = (backup?.interval_seconds || 60) / 60;
         interval.disabled = unavailable || !backup.configured || saves.updatingBackup;
         if (!saves.intervalEdited && interval.value !== String(minutes)) interval.value = minutes;
+        const intervalValue = interval.valueAsNumber;
+        $("savesIntervalUp").disabled = interval.disabled ||
+          (interval.validity.valid && intervalValue >= Number(interval.max));
+        $("savesIntervalDown").disabled = interval.disabled ||
+          (interval.validity.valid && intervalValue <= Number(interval.min));
         $("savesSave").disabled = interval.disabled || !interval.validity.valid ||
-          interval.valueAsNumber === minutes;
+          intervalValue === minutes;
         const platforms = [backup?.ps4 && "PS4", backup?.ps5 && "PS5"].filter(Boolean).join(" / ");
         $("savesContents").textContent = backup?.configured
           ? [platforms || t("savesPlatformsOff"), backup.trophies && t("savesTrophies")].filter(Boolean).join(" · ")
@@ -5209,6 +5229,16 @@
       function gameNameForSave(title) {
         const game = state.games.find(entry => entry.title_id === title);
         return game?.title_name || title;
+      }
+
+      function stepBackupInterval(increase) {
+        const interval = $("savesInterval");
+        if (interval.disabled) return;
+        if (!Number.isFinite(interval.valueAsNumber))
+          interval.value = (saves.backup?.interval_seconds || 60) / 60;
+        if (increase) interval.stepUp();
+        else interval.stepDown();
+        interval.dispatchEvent(new Event("input"));
       }
 
       function saveTimeLabel(milliseconds) {
@@ -6627,6 +6657,8 @@
         saves.intervalEdited = true;
         renderBackupStatus();
       });
+      $("savesIntervalUp").addEventListener("click", () => stepBackupInterval(true));
+      $("savesIntervalDown").addEventListener("click", () => stepBackupInterval(false));
       $("savesSave").addEventListener("click", () => {
         const input = $("savesInterval");
         if (input.validity.valid) changeSaveBackup({ interval_minutes: input.valueAsNumber });
