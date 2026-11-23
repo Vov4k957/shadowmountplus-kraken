@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
-  <meta name="shadowmount-saves" content="2">
+  <meta name="shadowmount-saves" content="3">
   <title>ShadowMount+ Library</title>
   <link rel="icon" type="image/png" sizes="512x512" href="/favicon.png">
   <style>
@@ -579,16 +579,23 @@
     .save-filters label { display: grid; gap: 5px; min-width: 0; }
     .save-filters select, .save-filters input { width: 100%; min-width: 0; }
     .save-list { display: grid; gap: 8px; }
-    .save-row { display: grid; align-items: center; gap: 12px; padding: 12px 14px; background: #101e32; border: 1px solid var(--line); border-radius: 12px; grid-template-columns: minmax(0, 1fr) minmax(110px, 28%) auto; }
-    .save-row > div, .save-row select { min-width: 0; overflow-wrap: anywhere; }
-    .save-row .subtle, .save-schedule { display: block; margin-top: 4px; }
+    .save-game { min-width: 0; }
+    .btn.save-game-toggle { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px; width: 100%; padding: 10px 14px; text-align: start; white-space: normal; overflow-wrap: anywhere; background: #101e32; }
+    .btn.save-game-toggle:hover, .btn.save-game-toggle[aria-expanded="true"] { background: #172b44; }
+    .save-game-toggle::after { content: ""; width: 8px; height: 8px; border: solid currentColor; border-width: 0 2px 2px 0; transform: rotate(45deg); }
+    .save-game-toggle[aria-expanded="true"]::after { transform: rotate(225deg); }
+    .save-game-options { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); align-items: end; gap: 12px; padding: 12px 14px; border-bottom: 1px solid var(--line); }
+    .save-game-options label { display: grid; gap: 5px; min-width: 0; }
+    .save-game-options select { width: 100%; min-width: 0; }
+    .save-game-options p { grid-column: 1 / -1; margin: 0; }
+    .save-game-toggle .subtle, .save-schedule { display: block; margin-top: 4px; }
     .saves-error { color: var(--red); }
     @media (max-width: 660px) {
       .save-filters { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
     @media (max-width: 540px) {
-      .save-actions, .save-row { grid-template-columns: minmax(0, 1fr) auto; }
-      .save-actions > div, .save-row > div { grid-column: 1 / -1; }
+      .save-actions { grid-template-columns: minmax(0, 1fr) auto; }
+      .save-actions > div { grid-column: 1 / -1; }
       .save-actions > button { grid-column: 1 / -1; }
     }
     .console-heading { margin-bottom: 18px; }
@@ -996,8 +1003,8 @@
           <h3 data-i18n="savesRestoreHeading">Restore from M.2</h3>
           <p class="subtle console-hint" data-i18n="savesRestoreHint">Close the game before restoring. If the selected profile has no save yet, create one in the game first.</p>
           <div class="save-filters">
-            <label><span class="subtle" data-i18n="savesProfile">Profile</span><select id="savesProfile" disabled></select></label>
-            <label><span class="subtle" data-i18n="savesVersion">Backup</span><select id="savesVersion" disabled></select></label>
+            <label><span class="subtle" data-i18n="savesProfile">Destination profile</span><select id="savesProfile" disabled></select></label>
+            <label><span class="subtle" data-i18n="savesVersionFilter">Show backups</span><select id="savesVersion" disabled></select></label>
             <label><span class="subtle" data-i18n="savesSearch">Game or slot</span><input id="savesSearch" type="search" autocomplete="off"></label>
             <button class="btn" id="savesRefresh" type="button" data-i18n="refresh">Refresh</button>
           </div>
@@ -1320,7 +1327,7 @@
       };
       const $ = (id) => document.getElementById(id);
       const saves = {
-        catalog: null, loading: false, restoreBusy: false,
+        catalog: null, selection: null, loading: false, restoreBusy: false,
         restoreMessage: null, backup: null, backupError: null,
         updatingBackup: false, readingBackup: false, backupTimer: 0, backupRequest: 0
       };
@@ -3213,11 +3220,13 @@
         savesBackupUnavailable: "Backup worker unavailable.",
         savesRestoreHeading: "Restore from M.2",
         savesRestoreHint: "Close the game before restoring. If the selected profile has no save yet, create one in the game first.",
-        savesProfile: "Profile",
+        savesProfile: "Destination profile",
+        savesVersionFilter: "Show backups",
         savesVersion: "Backup",
         savesAllVersions: "All backups",
         savesLatest: "Latest backup",
         savesSearch: "Game or slot",
+        savesSlot: "Slot",
         savesTarget: "Destination slot",
         savesRestore: "Restore",
         savesGetCopies: "Reading backups from M.2…",
@@ -3254,11 +3263,13 @@
         savesBackupUnavailable: "Служба резервного копирования недоступна.",
         savesRestoreHeading: "Восстановление с M.2",
         savesRestoreHint: "Полностью закрой игру перед восстановлением. Если у профиля ещё нет сохранения, сначала создай его в игре.",
-        savesProfile: "Профиль",
+        savesProfile: "Профиль назначения",
+        savesVersionFilter: "Показать копии",
         savesVersion: "Копия",
         savesAllVersions: "Все копии",
         savesLatest: "Последняя копия",
         savesSearch: "Игра или слот",
+        savesSlot: "Слот",
         savesTarget: "Слот назначения",
         savesRestore: "Восстановить",
         savesGetCopies: "Читаю копии с M.2…",
@@ -3943,7 +3954,7 @@
             api("/games", { include_size: $("includeSize").checked })
           ]);
           state.games = games.games || [];
-          if (navigation.view === "saves" && !saves.restoreBusy) renderSaves();
+          if (navigation.view === "saves" && !saves.restoreBusy && !activeDialog()) renderSaves();
           state.apiVersion = version;
           $("version").textContent = `ShadowMount+ ${version.shadowmount_version}`;
           setConnection("online", "connected");
@@ -5170,6 +5181,91 @@
         if (values.some(([value]) => value === selected)) select.value = selected;
       }
 
+      function saveChoice(id, labelKey) {
+        const label = node("label");
+        const select = node("select");
+        select.id = id;
+        label.append(node("span", "subtle", t(labelKey)), select);
+        return { label, select };
+      }
+
+      function renderSaveGameOptions(panel, game, busy) {
+        const copies = new Map();
+        for (const item of game.items) {
+          const key = `${item.version}/${item.backup_user}`;
+          if (!copies.has(key)) copies.set(key, { version: item.version, user: item.backup_user, slots: new Map() });
+          const slots = copies.get(key).slots;
+          if (!slots.has(item.slot)) slots.set(item.slot, new Map());
+          if (item.image) slots.get(item.slot).set(item.image, item);
+        }
+        const selection = saves.selection;
+        const showSource = new Set(game.items.map(item => item.backup_user)).size > 1;
+        const destination = parseInt(saves.catalog.selected_user, 16);
+        const forProfile = user => Number(parseInt(user, 16) === destination);
+        const orderedCopies = Array.from(copies).sort(([, a], [, b]) =>
+          Number(b.version === "latest") - Number(a.version === "latest") ||
+          b.version.localeCompare(a.version) || forProfile(b.user) - forProfile(a.user) || a.user.localeCompare(b.user));
+        const copy = saveChoice("savesSelectedCopy", "savesVersion");
+        const slot = saveChoice("savesSelectedSlot", "savesSlot");
+        const target = saveChoice("savesSelectedTarget", "savesTarget");
+        const missing = node("p", "subtle", t("savesTargetMissing"));
+        const restore = node("button", "btn primary", t("savesRestore"));
+        restore.type = "button";
+        restore.id = "savesRestoreSelected";
+        setSaveOptions(copy.select, orderedCopies.map(([key, value]) => [key, showSource
+          ? `${saveVersionLabel(value.version)} · ${value.user}` : saveVersionLabel(value.version)]), selection.copy);
+        copy.select.disabled = busy || orderedCopies.length < 2;
+
+        const currentSlots = () => copies.get(copy.select.value).slots;
+        const currentTargets = () => currentSlots().get(slot.select.value);
+        const updateTargets = () => {
+          const images = Array.from(currentTargets().keys()).sort();
+          const names = images.map(image => image.replace(/^sdimg_/, ""));
+          const uniqueNames = new Set(names).size === images.length;
+          const sameSlot = images[names.indexOf(slot.select.value)];
+          setSaveOptions(target.select, images.map((image, i) => [image, uniqueNames ? names[i] : image]),
+            images.includes(selection.target) ? selection.target : sameSlot);
+          selection.target = target.select.value;
+          target.select.disabled = busy || images.length < 2;
+          target.label.hidden = images.length === 0 || (images.length === 1 && Boolean(sameSlot));
+          restore.hidden = images.length === 0;
+          restore.disabled = busy;
+          missing.hidden = images.length > 0;
+        };
+        const updateSlots = () => {
+          const names = Array.from(currentSlots().keys()).sort((a, b) => a.localeCompare(b, currentLanguage, { numeric: true }));
+          setSaveOptions(slot.select, names.map(name => [name, name]), selection.slot);
+          selection.copy = copy.select.value;
+          selection.slot = slot.select.value;
+          slot.select.disabled = busy || names.length < 2;
+          updateTargets();
+        };
+        updateSlots();
+        copy.select.addEventListener("change", () => {
+          selection.target = "";
+          updateSlots();
+        });
+        slot.select.addEventListener("change", () => {
+          selection.slot = slot.select.value;
+          selection.target = "";
+          updateTargets();
+        });
+        target.select.addEventListener("change", () => { selection.target = target.select.value; });
+        restore.addEventListener("click", () => {
+          const item = currentTargets().get(target.select.value);
+          if (item) restoreSave(item, game.title,
+            copy.select.selectedOptions[0].textContent, target.select.selectedOptions[0].textContent);
+        });
+        panel.append(copy.label, slot.label, target.label, restore, missing);
+      }
+
+      function selectSaveGame(key) {
+        const previous = saves.selection?.game;
+        saves.selection = previous === key || !key ? null : { game: key, copy: "", slot: "", target: "" };
+        renderSaves();
+        focusControl($(`save-game-${key || previous}`) || $("savesSearch"));
+      }
+
       function renderSaves() {
         renderBackupStatus();
         const catalog = saves.catalog;
@@ -5184,10 +5280,13 @@
           saves.loading ? t("savesGetCopies") :
           catalog?.truncated ? t("savesTruncated", { count: catalog.items.length }) : "";
         const list = $("savesList");
-        while (list.firstChild) list.removeChild(list.firstChild);
-        if (!catalog) return;
+        const focused = list.contains(document.activeElement) ? document.activeElement.id : "";
+        if (!catalog) {
+          replaceContent(list);
+          return;
+        }
         if (!catalog.mounted) {
-          list.append(node("p", "empty", t("savesNoM2")));
+          replaceContent(list, node("p", "empty", t("savesNoM2")));
           return;
         }
         const filter = $("savesSearch").value.trim().toLowerCase();
@@ -5195,41 +5294,46 @@
         const groups = new Map();
         for (const item of catalog.items) {
           if (version && item.version !== version) continue;
-          const title = gameNameForSave(item.title_id);
+          const key = `${item.platform}-${item.title_id}`;
+          const game = groups.get(key);
+          const title = game ? game.title : gameNameForSave(item.title_id);
           if (filter && ![title, item.title_id, item.slot].some(value => value.toLowerCase().includes(filter))) continue;
-          const key = JSON.stringify([item.title_id, item.platform, item.slot, item.version, item.backup_user]);
-          if (!groups.has(key)) groups.set(key, { item, title, targets: [] });
-          if (item.image) groups.get(key).targets.push(item);
+          if (game) game.items.push(item);
+          else groups.set(key, { title, id: item.title_id, platform: item.platform, items: [item] });
         }
+        if (!groups.has(saves.selection?.game)) saves.selection = null;
         if (!groups.size) {
-          list.append(node("p", "empty", t("savesNoMatches")));
+          replaceContent(list, node("p", "empty", t("savesNoMatches")));
           return;
         }
-        const rows = Array.from(groups.values()).sort((left, right) =>
-          left.title.localeCompare(right.title, currentLanguage) ||
-          right.item.version.localeCompare(left.item.version) ||
-          left.item.slot.localeCompare(right.item.slot));
-        for (const { item, title, targets } of rows) {
-          const row = node("div", "save-row");
-          const details = node("div");
-          details.append(node("strong", "", title === item.title_id ? title : `${title} · ${item.title_id}`),
-            node("span", "subtle", `${item.platform.toUpperCase()} · ${item.slot} · ${saveVersionLabel(item.version)} · ${item.backup_user}`));
-          row.append(details);
-          if (!targets.length) {
-            row.append(node("span", "subtle", t("savesTargetMissing")));
-          } else {
-            const target = node("select");
-            target.setAttribute("aria-label", t("savesTarget"));
-            const matching = targets.find(value => value.image.replace(/^sdimg_/, "") === item.slot);
-            setSaveOptions(target, targets.map(value => [value.image, value.image.replace(/^sdimg_/, "")]), matching?.image);
-            target.disabled = busy;
-            const button = node("button", "btn primary", t("savesRestore"));
-            button.type = "button";
-            button.disabled = busy;
-            button.addEventListener("click", () => restoreSave(targets.find(value => value.image === target.value), title));
-            row.append(target, button);
-          }
-          list.append(row);
+        const rows = Array.from(groups).sort(([, a], [, b]) =>
+          a.title.localeCompare(b.title, currentLanguage) || a.platform.localeCompare(b.platform) || a.id.localeCompare(b.id));
+        const content = document.createDocumentFragment();
+        for (const [key, game] of rows) {
+          const expanded = saves.selection?.game === key;
+          const row = node("div", "save-game");
+          const toggle = node("button", "btn save-game-toggle");
+          toggle.id = `save-game-${key}`;
+          toggle.type = "button";
+          toggle.setAttribute("aria-expanded", String(expanded));
+          const summary = node("span");
+          summary.append(node("strong", "", game.title), node("span", "subtle",
+            game.title === game.id ? game.platform.toUpperCase() : `${game.platform.toUpperCase()} · ${game.id}`));
+          toggle.append(summary);
+          toggle.addEventListener("click", () => selectSaveGame(key));
+          const options = node("div", "save-game-options");
+          options.id = `save-options-${key}`;
+          options.hidden = !expanded;
+          toggle.setAttribute("aria-controls", options.id);
+          if (expanded) renderSaveGameOptions(options, game, busy);
+          row.append(toggle, options);
+          content.append(row);
+        }
+        replaceContent(list, content);
+        if (focused && navigation.view === "saves" && !activeDialog()) {
+          const control = $(focused);
+          focusControl(control && !control.disabled && !control.closest("[hidden]") ? control :
+            $(`save-game-${saves.selection?.game}`) || $("savesSearch"));
         }
       }
 
@@ -5267,7 +5371,8 @@
           saves.backup = backup;
           saves.backupError = null;
           if (["running", "queued"].includes(previous) &&
-              ["ready", "backup_error"].includes(saves.backup.state) && navigation.view === "saves" && !saves.restoreBusy)
+              ["ready", "backup_error"].includes(saves.backup.state) && navigation.view === "saves" &&
+              !saves.restoreBusy && !activeDialog())
             loadSaveCatalog();
         } catch (error) {
           if (request !== saves.backupRequest) return;
@@ -5295,13 +5400,13 @@
         }
       }
 
-      async function restoreSave(item, title) {
+      async function restoreSave(item, title, copyLabel, targetLabel) {
         if (!item || saves.restoreBusy || saves.loading) return;
         const game = title;
         if (!await confirmAction(t("savesConfirm", {
-          game, slot: item.slot, version: saveVersionLabel(item.version),
+          game, slot: item.slot, version: copyLabel,
           user: $("savesProfile").selectedOptions[0]?.textContent || item.user,
-          target: item.image.replace(/^sdimg_/, "")
+          target: targetLabel
         }), t("savesRestore"))) return;
         saves.restoreBusy = true;
         saves.restoreMessage = { key: "savesRestoring", values: { game } };
@@ -5320,7 +5425,10 @@
         } finally {
           saves.restoreBusy = false;
           renderSaves();
-          if (navigation.view === "saves" && !activeDialog()) focusControl($("savesRefresh"));
+          if (navigation.view === "saves" && !activeDialog()) {
+            const button = $("savesRestoreSelected");
+            focusControl(button && !button.hidden ? button : $("savesRefresh"));
+          }
         }
       }
 
@@ -6257,6 +6365,7 @@
         else if (!$("logModal").hidden) closeDebugLog();
         else if (!$("modal").hidden) closeModal();
         else if (navigation.view === "packages" && state.packages?.path) refreshPackages(state.packages.parent || "", true);
+        else if (navigation.view === "saves" && saves.selection && !saves.restoreBusy) selectSaveGame(null);
         else {
           if (navigation.view !== "library") switchView("library");
           const selected = Array.from($("games").querySelectorAll(".game-open"))
