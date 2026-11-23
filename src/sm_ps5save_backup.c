@@ -1602,12 +1602,10 @@ scan_saves(const char *uid, int ps5, backup_stats_t *stats) {
     }
     if(result == SV_OK) {
       pending_remove(uid, td->d_name, ps5);
-      version_list_t dates = {0};
-      if(legacy_dates(&dates) || prune_game_versions(platform, uid, td->d_name, &dates)) {
+      if(prune_game_versions(platform, uid, td->d_name)) {
         logq("Failed to prune old backups for %s", tlabel);
         stats->failed++;
       }
-      free(dates.names);
     }
   }
 

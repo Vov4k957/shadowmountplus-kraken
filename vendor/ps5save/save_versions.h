@@ -1,5 +1,4 @@
 /* The worker holds the backup/restore lock while publishing or pruning. */
-#define LEGACY_DAILY_ROOT "backup_daily"
 #define VERSION_STAGING ".incomplete"
 #define VERSIONS_TO_KEEP 3u
 
@@ -15,13 +14,14 @@ version_newest_first(const void *a, const void *b) {
 
 static int
 list_versions(int fd, int (*valid)(const char *), version_list_t *list) {
-  int dup_fd = openat(fd, ".", O_RDONLY | O_DIRECTORY);
+  int dup_fd = dup(fd);
   if(dup_fd < 0) return -1;
   DIR *dir = fdopendir(dup_fd);
   if(!dir) {
     close(dup_fd);
     return -1;
   }
+  rewinddir(dir);
   int error = 0;
   size_t capacity = 0;
   while(!interrupted()) {
@@ -156,128 +156,38 @@ clone_version_tree(const char *src, const char *dst, uint64_t *bytes, unsigned d
   return rc || interrupted() ? -1 : sync_backup_path(dst);
 }
 
-static bool
-legacy_slot_data(int slot, unsigned depth) {
-  if(depth > 31 || interrupted()) return false;
-  int fd = openat(slot, ".", O_RDONLY | O_DIRECTORY);
-  if(fd < 0) return false;
-  DIR *dir = fdopendir(fd);
-  if(!dir) {
-    close(fd);
-    return false;
-  }
-  bool found = false;
-  struct dirent *e;
-  while(!found && (e = readdir(dir))) {
-    if(e->d_name[0] == '.' || (!depth && !strcmp(e->d_name, "sce_sys"))) continue;
-    size_t n = strlen(e->d_name);
-    if(n >= 5 && !strcmp(e->d_name + n - 5, ".part")) continue;
-    struct stat st;
-    if(fstatat(slot, e->d_name, &st, AT_SYMLINK_NOFOLLOW)) continue;
-    if(S_ISREG(st.st_mode)) found = true;
-    if(S_ISDIR(st.st_mode)) {
-      int sub = openat(slot, e->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
-      if(sub < 0) continue;
-      found = same_backup_volume(sub) && legacy_slot_data(sub, depth + 1);
-      close(sub);
-    }
-  }
-  closedir(dir);
-  return found;
-}
-
-static bool
-legacy_game_usable(int game, bool latest) {
-  if(!same_backup_volume(game)) return false;
-  int fd = openat(game, ".", O_RDONLY | O_DIRECTORY);
-  if(fd < 0) return false;
-  DIR *dir = fdopendir(fd);
-  if(!dir) {
-    close(fd);
-    return false;
-  }
-  bool found = false;
-  struct dirent *e;
-  while(!found && (e = readdir(dir))) {
-    if(e->d_name[0] == '.') continue;
-    int slot = openat(game, e->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
-    if(slot < 0) continue;
-    found = same_backup_volume(slot) && (!latest || sm_ps5save_valid_stamp(slot)) &&
-        legacy_slot_data(slot, 0);
-    close(slot);
-  }
-  closedir(dir);
-  return found;
-}
-
+/* Rotation is limited to versions published by this worker. The older
+ * PS5Save and PS5Upload folders can also hold manually copied saves. */
 static int
-prune_legacy_game(const char *saves, const char *platform, const char *uid,
-                  const char *title, bool latest, unsigned *kept) {
-  char parent[128];
-  snprintf(parent, sizeof parent, "%s/%s/%s", saves, platform, uid);
-  int fd = open_backup_dir(parent);
-  if(fd < 0) return errno == ENOENT ? 0 : -1;
-  int game = openat(fd, title, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
-  int rc = 0;
-  if(game >= 0) {
-    if(legacy_game_usable(game, latest) && ++*kept > VERSIONS_TO_KEEP)
-      rc = remove_backup_tree(fd, title, 0);
-    close(game);
-  }
-  close(fd);
-  return rc;
-}
-
-static int
-prune_game_versions(const char *platform, const char *uid, const char *title,
-                    const version_list_t *dates) {
+prune_game_versions(const char *platform, const char *uid, const char *title) {
   char path[128];
   snprintf(path, sizeof path, SM_PS5SAVE_VERSIONS "/%s/%s/%s", platform, uid, title);
   int fd = open_backup_dir(path);
-  unsigned kept = 0;
-  int rc = 0;
-  if(fd >= 0) {
-    version_list_t list = {0};
-    rc = list_versions(fd, sm_ps5save_version_name, &list);
-    if(!rc) {
-      for(size_t i = 0; i < list.count; i++) {
-        if(completed_at(fd, list.names[i]) && ++kept > VERSIONS_TO_KEEP &&
-           remove_backup_tree(fd, list.names[i], 0))
-          rc = -1;
-      }
-      if(remove_backup_tree(fd, VERSION_STAGING, 0)) rc = -1;
-    }
-    free(list.names);
-    close(fd);
-  } else if(errno != ENOENT) rc = -1;
-  if(rc) return rc;
-
-  if(prune_legacy_game(BACKUP_ROOT "/saves", platform, uid, title, true, &kept))
-    rc = -1;
-  for(size_t i = 0; i < dates->count && !interrupted(); i++) {
-    snprintf(path, sizeof path, LEGACY_DAILY_ROOT "/%s/saves", dates->names[i]);
-    if(prune_legacy_game(path, platform, uid, title, false, &kept)) rc = -1;
-  }
-  return rc;
-}
-
-static int
-legacy_dates(version_list_t *dates) {
-  int fd = open_backup_dir(LEGACY_DAILY_ROOT);
   if(fd < 0) return errno == ENOENT ? 0 : -1;
-  int rc = list_versions(fd, sm_ps5save_legacy_date, dates);
+  unsigned kept = 0;
+  version_list_t list = {0};
+  int rc = list_versions(fd, sm_ps5save_version_name, &list);
+  if(!rc) {
+    for(size_t i = 0; i < list.count; i++) {
+      if(completed_at(fd, list.names[i]) && ++kept > VERSIONS_TO_KEEP &&
+         remove_backup_tree(fd, list.names[i], 0))
+        rc = -1;
+    }
+    if(remove_backup_tree(fd, VERSION_STAGING, 0)) rc = -1;
+  }
+  free(list.names);
   close(fd);
   return rc;
 }
 
 static int
-prune_saved_games(const char *saves, const version_list_t *dates) {
+prune_all_versions(void) {
   int rc = 0;
   const char *platforms[] = {"ps4", "ps5"};
   for(size_t p = 0; p < 2 && !interrupted(); p++) {
     const char *platform = platforms[p];
     char folder[128];
-    snprintf(folder, sizeof folder, "%s/%s", saves, platform);
+    snprintf(folder, sizeof folder, SM_PS5SAVE_VERSIONS "/%s", platform);
     int fd = open_backup_dir(folder);
     if(fd < 0) {
       if(errno != ENOENT) rc = -1;
@@ -291,15 +201,13 @@ prune_saved_games(const char *saves, const version_list_t *dates) {
     const struct dirent *u;
     while(!interrupted() && (u = readdir(users))) {
       if(!is_hex_name(u->d_name)) continue;
-      /* Collect title names before pruning. A legacy title can be removed
-       * from this same directory. */
       int user = openat(fd, u->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
       if(user < 0) continue;
       version_list_t games = {0};
       if(same_backup_volume(user)) {
         if(list_versions(user, title_valid, &games)) rc = -1;
         else for(size_t i = 0; i < games.count && !interrupted(); i++) {
-          if(prune_game_versions(platform, u->d_name, games.names[i], dates))
+          if(prune_game_versions(platform, u->d_name, games.names[i]))
             rc = -1;
         }
       }
@@ -308,22 +216,5 @@ prune_saved_games(const char *saves, const version_list_t *dates) {
     }
     closedir(users);
   }
-  return rc;
-}
-
-static int
-prune_all_versions(void) {
-  version_list_t dates = {0};
-  int rc = legacy_dates(&dates);
-  if(!rc) {
-    if(prune_saved_games(SM_PS5SAVE_VERSIONS, &dates)) rc = -1;
-    if(prune_saved_games(BACKUP_ROOT "/saves", &dates)) rc = -1;
-    for(size_t i = 0; i < dates.count && !interrupted(); i++) {
-      char path[64];
-      snprintf(path, sizeof path, LEGACY_DAILY_ROOT "/%s/saves", dates.names[i]);
-      if(prune_saved_games(path, &dates)) rc = -1;
-    }
-  }
-  free(dates.names);
   return rc;
 }

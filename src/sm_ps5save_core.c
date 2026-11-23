@@ -80,7 +80,7 @@ static int open_dir(int parent, const char *name) {
 }
 /* Open one component at a time so even intermediate symlinks are rejected. */
 int sm_ps5save_open_dir(int parent, const char *path) {
-  int fd = open_dir(parent, ".");
+  int fd = dup(parent);
   while (fd >= 0 && *path) {
     size_t n = strcspn(path, "/");
     char name[256];
@@ -232,10 +232,11 @@ static int walk_slot(int source, int destination, unsigned depth, slot_copy_t *c
   if (depth > SM_SAVE_TREE_DEPTH_MAX) return -1;
   struct stat before, after;
   if (destination >= 0 && fstat(source, &before) != 0) return -1;
-  int fd = open_dir(source, ".");
+  int fd = dup(source);
   if (fd < 0) return -1;
   DIR *dir = fdopendir(fd);
   if (!dir) { close(fd); return -1; }
+  rewinddir(dir);
   int rc = 0;
   while (!rc) {
     errno = 0;

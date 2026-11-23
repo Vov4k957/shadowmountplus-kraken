@@ -5,9 +5,11 @@
  * backup_daily/YYYY-MM-DD/saves/...
  */
 #include "sm_platform.h"
+#include "sm_log.h"
 #include "sm_ps5save_restore.h"
 #include <json-c/json.h>
 #include <dirent.h>
+#include <errno.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
 
@@ -36,16 +38,20 @@ static int game_name(const char *name) {
       strspn(name, "ABCDEFGHIJKLMNOPQRSTUVWXYZ") == 4 &&
       strspn(name + 4, "0123456789") == 5;
 }
-static bool is_directory_at(int dir, const char *name) {
-  struct stat st;
-  return fstatat(dir, name, &st, AT_SYMLINK_NOFOLLOW) == 0 &&
-      S_ISDIR(st.st_mode);
-}
 static int directory_at(int fd, const char *name) {
   return openat(fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
 }
 static int directory(const char *path) {
   return open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+}
+static int catalog_directory(int volume, const char *path) {
+  int fd = sm_ps5save_open_dir(volume, path);
+  if (fd < 0 && errno != ENOENT) {
+    int error = errno ? errno : EIO;
+    log_debug("  [SAVES] Cannot read M.2 catalog folder %s: %s (errno %d)",
+              path, strerror(error), error);
+  }
+  return fd;
 }
 static void append_item(catalog_t *c, const char *platform,
                         const char *user, const char *backup_user,
@@ -104,7 +110,9 @@ static target_list_t load_targets(const catalog_t *c, const char *platform,
         !S_ISREG(st.st_mode)) continue;
     if (ps4) {
       char key[204];
-      snprintf(key, sizeof key, "%s.bin", slot_name);
+      size_t slot_len = strlen(slot_name);
+      memcpy(key, slot_name, slot_len);
+      memcpy(key + slot_len, ".bin", sizeof ".bin");
       if (fstatat(targets, key, &st, AT_SYMLINK_NOFOLLOW) != 0 ||
           !S_ISREG(st.st_mode)) continue;
     }
@@ -159,8 +167,7 @@ static void scan_slots(catalog_t *c, int title_fd, const char *platform,
   target_list_t targets = load_targets(c, platform, title);
   const struct dirent *s;
   while ((s = readdir(slots)) != NULL && !c->truncated) {
-    if (!safe_name(s->d_name) ||
-        !is_directory_at(title_fd, s->d_name)) continue;
+    if (!safe_name(s->d_name)) continue;
     int slotfd = directory_at(title_fd, s->d_name);
     if (slotfd < 0) continue;
     bool valid = sm_ps5save_legacy_date(version) || sm_ps5save_valid_stamp(slotfd);
@@ -175,7 +182,7 @@ static void scan_slots(catalog_t *c, int title_fd, const char *platform,
 
 static void scan_game_versions(catalog_t *c, int title_fd, const char *platform,
                                const char *backup_user, const char *title) {
-  int fd = directory_at(title_fd, ".");
+  int fd = dup(title_fd);
   if (fd < 0) return;
   DIR *versions = fdopendir(fd);
   if (!versions) { close(fd); return; }
@@ -236,7 +243,7 @@ static void scan_version(catalog_t *c, int volume, const char *version) {
   else
     n = snprintf(path, sizeof(path), "PS5Save/backup_daily/%s/saves", version);
   if (n < 0 || (size_t)n >= sizeof(path)) return;
-  int saves = sm_ps5save_open_dir(volume, path);
+  int saves = catalog_directory(volume, path);
   if (saves < 0) return;
   for (size_t i = 0; i < 2 && !c->truncated; ++i) {
     const char *platform = i == 0 ? "ps5" : "ps4";
@@ -271,8 +278,10 @@ struct json_object *sm_ps5save_catalog(const char *user) {
     if (dir) {
       const struct dirent *e;
       while ((e = readdir(dir)) != NULL) {
-        if (hex_name(e->d_name, 8, 8) &&
-            is_directory_at(homes, e->d_name)) {
+        if (hex_name(e->d_name, 8, 8)) {
+          int profile_dir = directory_at(homes, e->d_name);
+          if (profile_dir < 0) continue;
+          close(profile_dir);
           struct json_object *profile = json_object_new_object();
           if (!profile) continue;
           char name[64] = {0};
@@ -284,9 +293,9 @@ struct json_object *sm_ps5save_catalog(const char *user) {
           json_object_object_add(profile, "name", json_object_new_string(name));
           json_object_array_add(users, profile);
           if (!selected[0] || !strcmp(foreground, e->d_name))
-            snprintf(selected, sizeof selected, "%s", e->d_name);
+            memcpy(selected, e->d_name, sizeof selected);
           if (valid_user && !strcmp(user, e->d_name))
-            snprintf(requested, sizeof requested, "%s", e->d_name);
+            memcpy(requested, e->d_name, sizeof requested);
         }
       }
       closedir(dir);
@@ -303,20 +312,25 @@ struct json_object *sm_ps5save_catalog(const char *user) {
         strcmp(st.f_mntonname, SM_PS5SAVE_VOLUME) == 0;
   }
   if (mounted) {
-    scan_version(&c, volume, NULL);
     scan_version(&c, volume, "latest");
-    int dfd = sm_ps5save_open_dir(volume, "PS5Save/backup_daily");
+    int dfd = catalog_directory(volume, "PS5Save/backup_daily");
     if (dfd >= 0) {
       DIR *dates = fdopendir(dfd);
       if (dates) {
         const struct dirent *e;
         while ((e = readdir(dates)) != NULL && !c.truncated) {
-          if (sm_ps5save_legacy_date(e->d_name) && is_directory_at(dfd, e->d_name))
+          if (sm_ps5save_legacy_date(e->d_name))
             scan_version(&c, volume, e->d_name);
         }
         closedir(dates);
       } else close(dfd);
     }
+    size_t legacy_count = c.count;
+    scan_version(&c, volume, NULL);
+    log_debug("  [SAVES] M.2 catalog: %zu legacy and %zu versioned restore options%s",
+              legacy_count, c.count - legacy_count, c.truncated ? " (truncated)" : "");
+  } else {
+    log_debug("  [SAVES] Cannot confirm the M.2 mount while reading the catalog");
   }
   if (volume >= 0) close(volume);
   json_object_object_add(root, "status", json_object_new_int(0));
