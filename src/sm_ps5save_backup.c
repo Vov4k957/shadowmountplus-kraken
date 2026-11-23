@@ -254,24 +254,13 @@ static int g_need_cleanup = 1;
 static int g_mount_stuck = 0;
 static int g_watch_game = 0;      /* protect the currently mounted title */
 static int g_game_abort = 0;      /* abort this save image only */
-static int g_backup_busy = 0;     /* one activity warning per copying pass */
-static int g_start_notified = 0;  /* one startup notification per process */
+static int g_backup_busy = 0;     /* one activity log entry per copying pass */
+static int g_start_logged = 0;
 static double g_last_watch = 0;
 static char g_abort_why[192];
 
 
-/* The save worker uses SM+'s notification and logging transports. */
 static void logq(const char *fmt, ...);
-
-static void
-notify(const char *fmt, ...) {
-  char message[2048];
-  va_list ap;
-  va_start(ap, fmt);
-  vsnprintf(message, sizeof message, fmt, ap);
-  va_end(ap);
-  notify_system_info("%s", message);
-}
 
 #include "../vendor/ps5save/backup_progress.h"
 
@@ -279,7 +268,7 @@ static void
 backup_activity_begin(void) {
   if(g_backup_busy) return;
   g_backup_busy = 1;
-  notify("Backing up saves to M.2");
+  logq("Backing up saves to M.2");
   progress_start();
 }
 
@@ -541,7 +530,6 @@ backup_file(const char *src, const char *dst, const struct stat *st,
   if(g_file_cap && (uint64_t)st->st_size > g_file_cap) {
     if(!seen_before(label)) {
       logq("Abnormal size of %s; skipping backup", label);
-      notify("File skipped: too large.");
     }
     stats->skipped++;
     return;
@@ -1161,7 +1149,7 @@ cleanup:
     if(unmount_save()) {
       g_mount_stuck = 1;
       logq("Failed to unmount save image; PS4/PS5 saves backup disabled");
-      notify("Save backup paused: cleanup failed.");
+      notify_system_info("Save backup paused: cleanup failed.");
       g_watch_game = 0;
       progress_finish();
       g_progress_image = 0;
@@ -1340,7 +1328,6 @@ scan_saves(const char *uid, int ps5, backup_stats_t *stats) {
         format_size(g_max_game, b, sizeof b);
         logq("Abnormal size of %s; skipping backup (%s%s, limit %s)", tlabel,
              overflow ? ">" : "", a, b);
-        notify("Game saves skipped: size limit exceeded.");
       }
       stats->skipped++;
       continue;
@@ -1367,7 +1354,7 @@ scan_saves(const char *uid, int ps5, backup_stats_t *stats) {
         format_size(data_free(), b, sizeof b);
         logq("Not enough internal storage for %s (need %s, free %s); "
              "skipping backup", tlabel, a, b);
-        notify("Game saves skipped: not enough console storage.");
+        notify_system_info("Game saves skipped: not enough console storage.");
       }
       stats->skipped++;
       continue;
@@ -1384,7 +1371,7 @@ scan_saves(const char *uid, int ps5, backup_stats_t *stats) {
         format_size(free_bytes, b, sizeof b);
         logq("Not enough space on M.2 for %s (need ~%s, free %s); "
              "skipping backup", tlabel, a, b);
-        notify("Game saves skipped: not enough space on M.2.");
+        notify_system_info("Game saves skipped: not enough space on M.2.");
       }
       stats->skipped++;
       continue;
@@ -1889,7 +1876,6 @@ daily_prune(const char *today) {
     snprintf(path, sizeof path, "%s/%s", DAILY_ROOT, names[i]);
     if(!remove_tree(path)) {
       logq("Daily backup %s deleted (keeping newest %d)", names[i], g_daily);
-      notify("Old daily snapshot removed.");
     } else {
       logq("Failed to delete old daily backup %s", names[i]);
     }
@@ -1947,7 +1933,7 @@ daily_check(void) {
       format_size(free_bytes, b, sizeof b);
       logq("Not enough space on M.2 for daily backup %s (need ~%s, free %s); "
            "skipping", ci.date, a, b);
-      notify("Daily snapshot skipped: not enough space on M.2.");
+      notify_system_info("Daily snapshot skipped: not enough space on M.2.");
     }
     return;
   }
@@ -1965,7 +1951,7 @@ daily_check(void) {
     snprintf(key, sizeof key, "daily-fail:%s", ci.date);
     if(!seen_before(key)) {
       logq("Failed to create daily backup %s", ci.date);
-      notify("Daily snapshot could not be saved.");
+      notify_system_info("Daily snapshot could not be saved.");
     }
     return;
   }
@@ -1973,7 +1959,6 @@ daily_check(void) {
   progress_finish();
   format_size(bytes, a, sizeof a);
   logq("Daily backup %s created (%s, console time %s)", ci.date, a, tz);
-  notify("Daily snapshot saved.");
   daily_prune(ci.date);
 }
 
@@ -2013,9 +1998,9 @@ run_cycle(FILE *f, int pending_only) {
   g_pending_only = pending_only;
   g_cycle_deferred = 0;
   g_backup_busy = 0;
-  if(!g_start_notified) {
-    notify("Backup utility started");
-    g_start_notified = 1;
+  if(!g_start_logged) {
+    logq("Backup utility started");
+    g_start_logged = 1;
   }
   memset(&stats, 0, sizeof stats);
   start = now_seconds();
@@ -2080,14 +2065,13 @@ run_cycle(FILE *f, int pending_only) {
     if(!g_last_failed) {
       logq("Failed to backup (%u file(s) failed, %u copied)",
            stats.failed, stats.copied);
-      notify("Backup incomplete (%u failed).", stats.failed);
+      notify_system_info("Backup incomplete (%u failed).", stats.failed);
     }
     g_last_failed = 1;
   } else if(stats.copied || (g_last_failed && !g_cycle_deferred)) {
     format_size(stats.bytes, size, sizeof size);
     logq("Successful backup (%s) done in %.1f seconds.", size,
          now_seconds() - start);
-    notify("Backup complete (%s).", size);
     g_last_failed = 0;
   } else if(g_cycle_deferred) {
     logq("Backup pass finished; protected titles queued (%u files unchanged)", stats.unchanged);

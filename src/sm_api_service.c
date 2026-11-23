@@ -2110,9 +2110,8 @@ static bool handle_index_page(struct MHD_Connection *connection) {
     return send_error_response(connection, 404, ENOENT,
                                "web UI is not a regular file");
   }
-  /* External UI overrides from older releases lack the integrated Saves tab.
-   * Its marker is in <head>, so validating an override needs only one read. */
-  const char ui_marker[] = "<meta name=\"shadowmount-saves\" content=\"1\">";
+  /* Check the Saves UI revision in <head> before serving an override. */
+  const char ui_marker[] = "<meta name=\"shadowmount-saves\" content=\"2\">";
   char head[4096];
   ssize_t size = pread(fd, head, sizeof head - 1, 0);
   if (size > 0) head[size] = '\0';

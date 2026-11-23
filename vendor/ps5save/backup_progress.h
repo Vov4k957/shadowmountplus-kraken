@@ -1,6 +1,6 @@
 /* Cycle progress: one unit per changed file, save image or daily snapshot.
  * Save images split their unit between staging and decrypted-file copying.
- * Only this state is shared with the notification worker. */
+ * Only this state is shared with the progress logger. */
 #ifndef BACKUP_PROGRESS_H
 #define BACKUP_PROGRESS_H
 
@@ -22,7 +22,7 @@ progress_percent_locked(void) {
   double done = (double)progress_completed;
   if(progress_current) done += progress_offset + progress_span * fraction;
   unsigned percent = progress_total ? (unsigned)(100.0 * done / progress_total) : 0;
-  if(percent > 99) percent = 99; /* completion is announced only after cleanup */
+  if(percent > 99) percent = 99; /* completion is logged after cleanup */
   if(percent < progress_last) percent = progress_last;
   progress_last = percent;
   return percent;
@@ -43,7 +43,7 @@ progress_worker(void *arg) {
     if(rc != ETIMEDOUT) break;
     unsigned percent = progress_percent_locked();
     pthread_mutex_unlock(&progress_mutex);
-    notify("Backing up... (%u%%)", percent);
+    logq("Backing up... (%u%%)", percent);
     pthread_mutex_lock(&progress_mutex);
   }
   pthread_mutex_unlock(&progress_mutex);
@@ -57,7 +57,7 @@ progress_stop(void) {
   progress_running = 0;
   pthread_cond_signal(&progress_cond);
   pthread_mutex_unlock(&progress_mutex);
-  /* Also wait for any notification already being sent before the final toast. */
+  /* Finish any progress log entry before writing the backup result. */
   pthread_join(progress_thread, NULL);
   progress_live = 0;
 }
@@ -83,7 +83,7 @@ progress_start(void) {
   int rc = pthread_create(&progress_thread, NULL, progress_worker, NULL);
   if(rc) {
     progress_running = 0;
-    logq("Progress notifications unavailable: %s", strerror(rc));
+    logq("Progress logger unavailable: %s", strerror(rc));
     return;
   }
   progress_live = 1;

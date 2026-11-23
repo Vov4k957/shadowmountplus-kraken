@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
-  <meta name="shadowmount-saves" content="1">
+  <meta name="shadowmount-saves" content="2">
   <title>ShadowMount+ Library</title>
   <link rel="icon" type="image/png" sizes="512x512" href="/favicon.png">
   <style>
@@ -3205,7 +3205,6 @@
         savesBackupReady: "Last backup pass complete.",
         savesBackupQueued: "Backup queued.",
         savesBackupRunning: "Backing up to M.2…",
-        savesBackupManualComplete: "Manual backup pass complete.",
         savesBackupPaused: "Automatic backups paused.",
         savesBackupNoM2: "A writable M.2 is unavailable.",
         savesBackupNoConfig: "The backup configuration is missing from /mnt/ext1/PS5Save/backup.conf.",
@@ -3247,7 +3246,6 @@
         savesBackupReady: "Последний проход копирования завершён.",
         savesBackupQueued: "Копирование поставлено в очередь.",
         savesBackupRunning: "Копирование на M.2…",
-        savesBackupManualComplete: "Ручное копирование завершено.",
         savesBackupPaused: "Автоматическое копирование приостановлено.",
         savesBackupNoM2: "Диск M.2 недоступен для записи.",
         savesBackupNoConfig: "Файл настроек /mnt/ext1/PS5Save/backup.conf не найден.",
@@ -5145,8 +5143,12 @@
           ["waiting", "ready"].includes(backup.state);
         status.classList.toggle("saves-error", Boolean(saves.backupError) ||
           ["no_m2", "no_config", "standalone_running", "backup_error", "unavailable"].includes(backup?.state));
-        status.textContent = saves.backupError ||
-          t(paused ? "savesBackupPaused" : backupStatusKeys[backup?.state] || "savesBackupWaiting");
+        let message = t(backupStatusKeys[backup?.state] || "savesBackupWaiting");
+        if (paused) {
+          const pauseStatus = t("savesBackupPaused");
+          message = backup.state === "ready" ? `${pauseStatus} ${message}` : pauseStatus;
+        }
+        status.textContent = saves.backupError || message;
       }
 
       function gameNameForSave(title) {
@@ -5265,10 +5267,8 @@
           saves.backup = backup;
           saves.backupError = null;
           if (["running", "queued"].includes(previous) &&
-              ["ready", "backup_error"].includes(saves.backup.state) && navigation.view === "saves" && !saves.restoreBusy) {
-            if (!backup.enabled && backup.state === "ready") toast(t("savesBackupManualComplete"));
+              ["ready", "backup_error"].includes(saves.backup.state) && navigation.view === "saves" && !saves.restoreBusy)
             loadSaveCatalog();
-          }
         } catch (error) {
           if (request !== saves.backupRequest) return;
           saves.backup = null;

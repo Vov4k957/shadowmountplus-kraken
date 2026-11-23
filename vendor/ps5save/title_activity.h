@@ -253,7 +253,6 @@ pending_defer(const char *uid, const char *title, int ps5) {
     p->ps5 = ps5;
     p->next = pending_titles;
     pending_titles = p;
-    notify("Save backup postponed (%s).", title);
   }
   p->ready = 0;
   p->retry_at = 0;
