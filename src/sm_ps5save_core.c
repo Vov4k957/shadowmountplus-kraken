@@ -39,14 +39,11 @@ static int title_id(const char *s) {
       strspn(s, "ABCDEFGHIJKLMNOPQRSTUVWXYZ") == 4 &&
       strspn(s + 4, "0123456789") == 5;
 }
-int sm_ps5save_legacy_date(const char *s) {
-  return strlen(s) == 10 && strspn(s, "0123456789") == 4 &&
+static int version(const char *s) {
+  return strcmp(s, "latest") == 0 ||
+      (strlen(s) == 10 && strspn(s, "0123456789") == 4 &&
        s[4] == '-' && strspn(s + 5, "0123456789") == 2 &&
-       s[7] == '-' && strspn(s + 8, "0123456789") == 2;
-}
-int sm_ps5save_version_name(const char *s) {
-  return strlen(s) == SM_PS5SAVE_VERSION_SIZE - 1 && s[0] == 'v' &&
-      strspn(s + 1, "0123456789") == SM_PS5SAVE_VERSION_SIZE - 2;
+       s[7] == '-' && strspn(s + 8, "0123456789") == 2);
 }
 static int filename(const char *s) {
   if (!*s || *s == '.') return 0;
@@ -62,9 +59,7 @@ int sm_ps5save_restore_image(const sm_ps5save_request_t *r,
   const char *name = prefixed ? r->image + 6 : r->image;
   if ((!ps4 && strcmp(r->platform, "ps5") != 0) ||
       !hex_user(r->user, 8) || !hex_user(r->backup_user, 1) ||
-      !title_id(r->title_id) ||
-      (strcmp(r->version, "latest") && !sm_ps5save_legacy_date(r->version) &&
-       !sm_ps5save_version_name(r->version)) ||
+      !title_id(r->title_id) || !version(r->version) ||
       !filename(r->slot) || !filename(name) ||
       strncmp(name, "sce_bu_", 7) == 0 || suffix(name, ".bin") ||
       suffix(name, ".ps5up-tmp") || suffix(name, ".smp-new") ||
@@ -78,39 +73,6 @@ int sm_ps5save_restore_image(const sm_ps5save_request_t *r,
 static int open_dir(int parent, const char *name) {
   return openat(parent, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
 }
-/* Open one component at a time so even intermediate symlinks are rejected. */
-int sm_ps5save_open_dir(int parent, const char *path) {
-  int fd = dup(parent);
-  while (fd >= 0 && *path) {
-    size_t n = strcspn(path, "/");
-    char name[256];
-    int next = -1;
-    if (n && n < sizeof name) {
-      memcpy(name, path, n);
-      name[n] = 0;
-      if (strcmp(name, ".") && strcmp(name, "..")) next = open_dir(fd, name);
-      else errno = EINVAL;
-    } else errno = EINVAL;
-    int error = errno;
-    close(fd);
-    errno = error;
-    fd = next;
-    path += n;
-    if (*path == '/') path++;
-  }
-  return fd;
-}
-int sm_ps5save_complete_version(int dir) {
-  int fd = openat(dir, SM_PS5SAVE_COMPLETE, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
-  if (fd < 0) return 0;
-  struct stat st;
-  char magic[sizeof SM_PS5SAVE_COMPLETE_MAGIC - 1];
-  int ok = fstat(fd, &st) == 0 && S_ISREG(st.st_mode) &&
-      st.st_size == sizeof magic && read(fd, magic, sizeof magic) == sizeof magic &&
-      memcmp(magic, SM_PS5SAVE_COMPLETE_MAGIC, sizeof magic) == 0;
-  close(fd);
-  return ok;
-}
 static int read_stamp(int slot, struct stat *st) {
   int fd = openat(slot, ".image_stamp", O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
   if (fd < 0) return -1;
@@ -121,30 +83,24 @@ static int read_stamp(int slot, struct stat *st) {
   close(fd);
   return ok ? 0 : -1;
 }
-int sm_ps5save_valid_stamp(int slot) {
-  struct stat stamp;
-  return read_stamp(slot, &stamp) == 0;
-}
 int sm_ps5save_open_slot(int volume, const sm_ps5save_request_t *r) {
   if (!r || sm_ps5save_restore_image(r, (char[512]){0}, 512) != 0)
     return -1;
   const int latest = strcmp(r->version, "latest") == 0;
-  const int stored = sm_ps5save_version_name(r->version);
-  char path[256];
-  if (stored)
-    snprintf(path, sizeof path, "PS5Save/" SM_PS5SAVE_VERSIONS "/%s/%s/%s/%s",
-             r->platform, r->backup_user, r->title_id, r->version);
-  else
-    snprintf(path, sizeof path, "PS5Save/%s%s/saves/%s/%s/%s",
-             latest ? "backup" : "backup_daily/", latest ? "" : r->version,
-             r->platform, r->backup_user, r->title_id);
-  int game = sm_ps5save_open_dir(volume, path);
-  if (game < 0) return -1;
-  int slot = !stored || sm_ps5save_complete_version(game)
-      ? open_dir(game, r->slot) : -1;
-  close(game);
+  const char *parts[] = {"PS5Save", latest ? "backup" : "backup_daily",
+                         r->version, "saves", r->platform, r->backup_user,
+                         r->title_id, r->slot};
+  int slot = dup(volume);
   if (slot < 0) return -1;
-  if ((latest || stored) && !sm_ps5save_valid_stamp(slot)) {
+  for (size_t i = 0; i < sizeof(parts) / sizeof(parts[0]); ++i) {
+    if (latest && i == 2) continue;
+    int next = open_dir(slot, parts[i]);
+    close(slot);
+    if (next < 0) return -1;
+    slot = next;
+  }
+  struct stat stamp;
+  if (latest && read_stamp(slot, &stamp) != 0) {
     close(slot);
     errno = EINVAL;
     return -1;
@@ -232,11 +188,10 @@ static int walk_slot(int source, int destination, unsigned depth, slot_copy_t *c
   if (depth > SM_SAVE_TREE_DEPTH_MAX) return -1;
   struct stat before, after;
   if (destination >= 0 && fstat(source, &before) != 0) return -1;
-  int fd = dup(source);
+  int fd = open_dir(source, ".");
   if (fd < 0) return -1;
   DIR *dir = fdopendir(fd);
   if (!dir) { close(fd); return -1; }
-  rewinddir(dir);
   int rc = 0;
   while (!rc) {
     errno = 0;

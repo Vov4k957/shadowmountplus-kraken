@@ -165,9 +165,8 @@ The built-in web interface is available through the **ShadowMount+** launcher on
 
 ### Saves on M.2
 
-- The **Saves** tab uses `/mnt/ext1/PS5Save/backup.conf`. For a fresh setup, copy `ps5save-backup.conf` to that folder as `backup.conf`. Use **Save** next to **Back up now** to set the interval in minutes (1–1440, default 1). The last-copy line records the time and result of the most recent copy attempt.
-- The integrated worker checks whether PS4 and PS5 saves changed and defers saves for games that are still open. It publishes a version in `backup_versions` after a complete game copy. On startup and after publishing a version, it retains three completed versions per platform, profile and game in that folder. The restore catalog also reads existing copies in `backup/saves` and `backup_daily`.
-- The same regular passes can copy local PS4 and PS5 trophy data to `/mnt/ext1/PS5Save/backup/user/`. The `backup_trophies` setting defaults to true. Close the game before a manual pass for a consistent per-file copy of trophy data. Trophies are copied for archival use.
+- The **Saves** tab reads current copies and daily snapshots from `/mnt/ext1/PS5Save/`. It uses the existing `backup.conf` there. For a fresh setup, copy `ps5save-backup.conf` to that folder as `backup.conf`.
+- The integrated backup worker starts with SM+. The supplied configuration checks PS4 and PS5 saves for all local profiles every 60 seconds, retains three daily snapshots, and defers saves from games that are still open. The tab provides a manual pass and an automatic-backup toggle.
 - To restore, close the game and pick a profile, backup and slot. A profile needs an existing in-game save to receive the restored files. The current save is backed up under `/data/ps5upload/save-backups/` before replacement, and the selected profile's `sce_sys` metadata is preserved.
 - Remove the standalone `backup-m2.elf` from autostart when switching to the integrated worker. Both builds use the same backup directory.
 

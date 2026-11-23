@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
-  <meta name="shadowmount-saves" content="6">
+  <meta name="shadowmount-saves" content="3">
   <title>ShadowMount+ Library</title>
   <link rel="icon" type="image/png" sizes="512x512" href="/favicon.png">
   <style>
@@ -575,14 +575,6 @@
     .saves-view .console-heading, .saves-view .package-toolbar { margin-bottom: 0; }
     .save-actions, .save-filters { display: grid; gap: 10px; align-items: end; }
     .save-actions { grid-template-columns: minmax(0, 1fr) auto; }
-    .save-controls { display: flex; gap: 10px; flex-wrap: wrap; align-items: end; }
-    .save-interval { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 5px 6px; align-items: center; }
-    .save-interval label { grid-column: 1 / -1; }
-    .save-interval input { width: 7em; appearance: textfield; -webkit-appearance: textfield; }
-    .save-interval input::-webkit-inner-spin-button,
-    .save-interval input::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
-    .save-interval-steps { display: grid; gap: 4px; }
-    .btn.save-interval-step { min-width: 42px; min-height: 34px; padding: 0; font-size: 19px; line-height: 1; }
     .save-filters { grid-template-columns: repeat(2, minmax(0, 1fr)) minmax(0, 1.5fr) auto; margin: 16px 0; }
     .save-filters label { display: grid; gap: 5px; min-width: 0; }
     .save-filters select, .save-filters input { width: 100%; min-width: 0; }
@@ -604,6 +596,7 @@
     @media (max-width: 540px) {
       .save-actions { grid-template-columns: minmax(0, 1fr) auto; }
       .save-actions > div { grid-column: 1 / -1; }
+      .save-actions > button { grid-column: 1 / -1; }
     }
     .console-heading { margin-bottom: 18px; }
     .console-heading h2 { margin-bottom: 5px; font-size: 27px; }
@@ -1000,22 +993,10 @@
             <div>
               <label class="console-setting"><span data-i18n="savesAutomatic">Automatic backups</span>
                 <input type="checkbox" id="savesAutomatic" disabled></label>
-              <span class="subtle save-schedule" id="savesContents"></span>
+              <span class="subtle save-schedule" id="savesSchedule"></span>
             </div>
-            <div class="save-controls">
-              <div class="save-interval">
-                <label for="savesInterval" class="subtle" data-i18n="savesInterval">Interval (min)</label>
-                <input type="number" id="savesInterval" min="1" max="1440" step="1" required disabled>
-                <div class="save-interval-steps">
-                  <button class="btn save-interval-step" id="savesIntervalUp" type="button" aria-label="Increase interval by one minute" data-i18n-aria-label="savesIntervalUp" disabled>↑</button>
-                  <button class="btn save-interval-step" id="savesIntervalDown" type="button" aria-label="Decrease interval by one minute" data-i18n-aria-label="savesIntervalDown" disabled>↓</button>
-                </div>
-              </div>
-              <button class="btn" id="savesRun" type="button" disabled data-i18n="savesRun">Back up now</button>
-              <button class="btn primary" id="savesSave" type="button" disabled data-i18n="savesSave">Save</button>
-            </div>
+            <button class="btn" id="savesRun" type="button" disabled data-i18n="savesRun">Back up now</button>
           </div>
-          <p class="subtle console-hint" id="savesLastCopy"></p>
           <p class="subtle console-hint" id="savesBackupStatus" role="status"></p>
         </div>
         <div class="panel">
@@ -1348,8 +1329,7 @@
       const saves = {
         catalog: null, selection: null, loading: false, restoreBusy: false,
         restoreMessage: null, backup: null, backupError: null,
-        updatingBackup: false, readingBackup: false, backupTimer: 0, backupRequest: 0,
-        intervalEdited: false
+        updatingBackup: false, readingBackup: false, backupTimer: 0, backupRequest: 0
       };
       const mainTabs = { library: "libraryTab", packages: "packagesTab", saves: "savesTab", console: "consoleTab" };
       const navigation = {
@@ -3226,26 +3206,15 @@
         savesBackupHeading: "Back up to M.2",
         savesAutomatic: "Automatic backups",
         savesRun: "Back up now",
-        savesInterval: "Interval (min)",
-        savesIntervalUp: "Increase interval by one minute",
-        savesIntervalDown: "Decrease interval by one minute",
-        savesSave: "Save",
-        savesTrophies: "PS4 and PS5 trophies",
-        savesLastCopy: "Last backup · {time} · {result}",
-        savesLastCopyNone: "Last backup · no data",
-        savesLastCopyOK: "Successful",
-        savesLastCopyError: "Failed",
+        savesSchedule: "Every {seconds} s · Daily snapshots kept: {days} · {platforms}",
         savesPlatformsOff: "Game saves disabled in backup.conf",
         savesBackupWaiting: "Waiting for the next backup pass.",
-        savesBackupReady: "",
+        savesBackupReady: "Last backup pass complete.",
         savesBackupQueued: "Backup queued.",
         savesBackupRunning: "Backing up to M.2…",
         savesBackupPaused: "Automatic backups paused.",
         savesBackupNoM2: "A writable M.2 is unavailable.",
         savesBackupNoConfig: "The backup configuration is missing from /mnt/ext1/PS5Save/backup.conf.",
-        savesBackupConfigError: "Could not read the backup configuration. See the SM+ log.",
-        savesBackupStorageError: "Could not prepare the backup folder on M.2. See the SM+ log.",
-        savesBackupServiceError: "Could not start the backup pass. See the SM+ log.",
         savesBackupStandalone: "The standalone backup payload is running. Stop it before starting an integrated backup.",
         savesBackupFailed: "Backup incomplete. See the SM+ log for details.",
         savesBackupUnavailable: "Backup worker unavailable.",
@@ -3255,8 +3224,7 @@
         savesVersionFilter: "Show backups",
         savesVersion: "Backup",
         savesAllVersions: "All backups",
-        savesLatest: "Previous format",
-        savesNewest: "Latest per game",
+        savesLatest: "Latest backup",
         savesSearch: "Game or slot",
         savesSlot: "Slot",
         savesTarget: "Destination slot",
@@ -3281,26 +3249,15 @@
         savesBackupHeading: "Копирование на M.2",
         savesAutomatic: "Автоматическое копирование",
         savesRun: "Скопировать сейчас",
-        savesInterval: "Интервал, мин",
-        savesIntervalUp: "Увеличить интервал на минуту",
-        savesIntervalDown: "Уменьшить интервал на минуту",
-        savesSave: "Сохранить",
-        savesTrophies: "Трофеи PS4 и PS5",
-        savesLastCopy: "Последнее копирование · {time} · {result}",
-        savesLastCopyNone: "Последнее копирование · нет данных",
-        savesLastCopyOK: "Успешно",
-        savesLastCopyError: "Ошибка",
+        savesSchedule: "Каждые {seconds} сек. · Дневных снимков: {days} · {platforms}",
         savesPlatformsOff: "Игровые сохранения отключены в backup.conf",
         savesBackupWaiting: "Ожидание следующего прохода.",
-        savesBackupReady: "",
+        savesBackupReady: "Последний проход копирования завершён.",
         savesBackupQueued: "Копирование поставлено в очередь.",
         savesBackupRunning: "Копирование на M.2…",
         savesBackupPaused: "Автоматическое копирование приостановлено.",
         savesBackupNoM2: "Диск M.2 недоступен для записи.",
         savesBackupNoConfig: "Файл настроек /mnt/ext1/PS5Save/backup.conf не найден.",
-        savesBackupConfigError: "Не удалось прочитать настройки бэкапа. Подробности в журнале SM+.",
-        savesBackupStorageError: "Не удалось подготовить папку копий на M.2. Подробности в журнале SM+.",
-        savesBackupServiceError: "Не удалось запустить копирование. Подробности в журнале SM+.",
         savesBackupStandalone: "Запущена отдельная нагрузка резервного копирования. Останови её перед запуском встроенной.",
         savesBackupFailed: "Копирование завершилось с ошибками. Подробности в журнале SM+.",
         savesBackupUnavailable: "Служба резервного копирования недоступна.",
@@ -3310,8 +3267,7 @@
         savesVersionFilter: "Показать копии",
         savesVersion: "Копия",
         savesAllVersions: "Все копии",
-        savesLatest: "Копия старого формата",
-        savesNewest: "Последняя по каждой игре",
+        savesLatest: "Последняя копия",
         savesSearch: "Игра или слот",
         savesSlot: "Слот",
         savesTarget: "Слот назначения",
@@ -5178,8 +5134,6 @@
         waiting: "savesBackupWaiting", ready: "savesBackupReady",
         queued: "savesBackupQueued", running: "savesBackupRunning",
         no_m2: "savesBackupNoM2", no_config: "savesBackupNoConfig",
-        storage_error: "savesBackupStorageError", config_error: "savesBackupConfigError",
-        service_error: "savesBackupServiceError",
         standalone_running: "savesBackupStandalone", backup_error: "savesBackupFailed",
         unavailable: "savesBackupUnavailable"
       };
@@ -5191,39 +5145,21 @@
         $("savesAutomatic").disabled = unavailable || saves.updatingBackup;
         $("savesRun").disabled = unavailable || saves.restoreBusy || saves.updatingBackup ||
           backup.busy || backup.state === "queued";
-        const interval = $("savesInterval");
-        const minutes = (backup?.interval_seconds || 60) / 60;
-        interval.disabled = unavailable || !backup.configured || saves.updatingBackup;
-        if (!saves.intervalEdited && interval.value !== String(minutes)) interval.value = minutes;
-        const intervalValue = interval.valueAsNumber;
-        $("savesIntervalUp").disabled = interval.disabled ||
-          (interval.validity.valid && intervalValue >= Number(interval.max));
-        $("savesIntervalDown").disabled = interval.disabled ||
-          (interval.validity.valid && intervalValue <= Number(interval.min));
-        $("savesSave").disabled = interval.disabled || !interval.validity.valid ||
-          intervalValue === minutes;
         const platforms = [backup?.ps4 && "PS4", backup?.ps5 && "PS5"].filter(Boolean).join(" / ");
-        $("savesContents").textContent = backup?.configured
-          ? [platforms || t("savesPlatformsOff"), backup.trophies && t("savesTrophies")].filter(Boolean).join(" · ")
+        $("savesSchedule").textContent = backup?.interval_seconds
+          ? t("savesSchedule", { seconds: backup.interval_seconds, days: backup.daily_snapshots, platforms: platforms || t("savesPlatformsOff") })
           : "";
-        const lastCopy = $("savesLastCopy");
-        lastCopy.classList.toggle("saves-error", Boolean(backup?.last_copy_at && !backup.last_copy_ok));
-        lastCopy.textContent = backup?.last_copy_at
-          ? t("savesLastCopy", {
-              time: saveTimeLabel(backup.last_copy_at * 1000),
-              result: t(backup.last_copy_ok ? "savesLastCopyOK" : "savesLastCopyError")
-            })
-          : t("savesLastCopyNone");
         const status = $("savesBackupStatus");
         const paused = backup && !backup.enabled && !backup.busy &&
           ["waiting", "ready"].includes(backup.state);
         status.classList.toggle("saves-error", Boolean(saves.backupError) ||
-          ["no_m2", "no_config", "standalone_running", "unavailable"].includes(backup?.state) ||
-          Boolean(backup?.state?.endsWith("_error")));
-        const message = paused ? t("savesBackupPaused") : backup?.state === "ready"
-          ? "" : t(backupStatusKeys[backup?.state] || "savesBackupWaiting");
+          ["no_m2", "no_config", "standalone_running", "backup_error", "unavailable"].includes(backup?.state));
+        let message = t(backupStatusKeys[backup?.state] || "savesBackupWaiting");
+        if (paused) {
+          const pauseStatus = t("savesBackupPaused");
+          message = backup.state === "ready" ? `${pauseStatus} ${message}` : pauseStatus;
+        }
         status.textContent = saves.backupError || message;
-        status.hidden = !status.textContent;
       }
 
       function gameNameForSave(title) {
@@ -5231,30 +5167,8 @@
         return game?.title_name || title;
       }
 
-      function stepBackupInterval(increase) {
-        const interval = $("savesInterval");
-        if (interval.disabled) return;
-        if (!Number.isFinite(interval.valueAsNumber))
-          interval.value = (saves.backup?.interval_seconds || 60) / 60;
-        if (increase) interval.stepUp();
-        else interval.stepDown();
-        interval.dispatchEvent(new Event("input"));
-      }
-
-      function saveTimeLabel(milliseconds) {
-        return new Date(milliseconds).toLocaleString(currentLanguage, {
-          year: "numeric", month: "2-digit", day: "2-digit",
-          hour: "2-digit", minute: "2-digit", second: "2-digit"
-        });
-      }
-
       function saveVersionLabel(version) {
-        if (version.startsWith("v")) return saveTimeLabel(Number(version.slice(1)) / 1000);
         return version === "latest" ? t("savesLatest") : version;
-      }
-
-      function compareSaveVersions(a, b) {
-        return b.localeCompare(a);
       }
 
       function setSaveOptions(select, values, selected) {
@@ -5289,7 +5203,8 @@
         const destination = parseInt(saves.catalog.selected_user, 16);
         const forProfile = user => Number(parseInt(user, 16) === destination);
         const orderedCopies = Array.from(copies).sort(([, a], [, b]) =>
-          compareSaveVersions(a.version, b.version) || forProfile(b.user) - forProfile(a.user) || a.user.localeCompare(b.user));
+          Number(b.version === "latest") - Number(a.version === "latest") ||
+          b.version.localeCompare(a.version) || forProfile(b.user) - forProfile(a.user) || a.user.localeCompare(b.user));
         const copy = saveChoice("savesSelectedCopy", "savesVersion");
         const slot = saveChoice("savesSelectedSlot", "savesSlot");
         const target = saveChoice("savesSelectedTarget", "savesTarget");
@@ -5376,18 +5291,9 @@
         }
         const filter = $("savesSearch").value.trim().toLowerCase();
         const version = $("savesVersion").value;
-        const latest = new Map();
-        const versionKey = item => `${item.platform}/${item.title_id}/${item.backup_user}`;
-        if (version === "newest") {
-          for (const item of catalog.items) {
-            const key = versionKey(item);
-            if (!latest.has(key) || compareSaveVersions(item.version, latest.get(key)) < 0)
-              latest.set(key, item.version);
-          }
-        }
         const groups = new Map();
         for (const item of catalog.items) {
-          if (version === "newest" && item.version !== latest.get(versionKey(item))) continue;
+          if (version && item.version !== version) continue;
           const key = `${item.platform}-${item.title_id}`;
           const game = groups.get(key);
           const title = game ? game.title : gameNameForSave(item.title_id);
@@ -5439,10 +5345,11 @@
         try {
           const catalog = await api("/saves/catalog", { user });
           const selected = $("savesVersion").value;
+          const versions = Array.from(new Set(catalog.items.map(item => item.version))).sort().reverse();
           const displayUser = value => typeof value === "string" ? [value, value] : [value.id, value.name || value.id];
           setSaveOptions($("savesProfile"), catalog.users.map(displayUser), catalog.selected_user);
           setSaveOptions($("savesVersion"), [["", t("savesAllVersions")],
-            ["newest", t("savesNewest")]], selected);
+            ...versions.map(value => [value, saveVersionLabel(value)])], selected);
           saves.catalog = catalog;
         } catch (error) {
           saves.catalog = null;
@@ -5459,12 +5366,11 @@
         const request = ++saves.backupRequest;
         try {
           const previous = saves.backup?.state;
-          const previousCopy = saves.backup?.last_copy_at;
           const backup = await api("/saves/backup");
           if (request !== saves.backupRequest) return;
           saves.backup = backup;
           saves.backupError = null;
-          if ((previousCopy !== backup.last_copy_at || ["running", "queued"].includes(previous)) &&
+          if (["running", "queued"].includes(previous) &&
               ["ready", "backup_error"].includes(saves.backup.state) && navigation.view === "saves" &&
               !saves.restoreBusy && !activeDialog())
             loadSaveCatalog();
@@ -5485,7 +5391,6 @@
         renderBackupStatus();
         try {
           saves.backup = await api("/saves/backup", payload, { "X-SM-Save-Backup": "confirmed" });
-          if (payload.interval_minutes !== undefined) saves.intervalEdited = false;
           saves.backupError = null;
         } catch (error) {
           saves.backupError = error.message;
@@ -6653,16 +6558,6 @@
       $("savesSearch").addEventListener("input", renderSaves);
       $("savesVersion").addEventListener("change", renderSaves);
       $("savesRun").addEventListener("click", () => changeSaveBackup({ run: true }));
-      $("savesInterval").addEventListener("input", () => {
-        saves.intervalEdited = true;
-        renderBackupStatus();
-      });
-      $("savesIntervalUp").addEventListener("click", () => stepBackupInterval(true));
-      $("savesIntervalDown").addEventListener("click", () => stepBackupInterval(false));
-      $("savesSave").addEventListener("click", () => {
-        const input = $("savesInterval");
-        if (input.validity.valid) changeSaveBackup({ interval_minutes: input.valueAsNumber });
-      });
       $("savesAutomatic").addEventListener("change", event => changeSaveBackup({ enabled: event.target.checked }));
       $("packageHome").addEventListener("click", () => refreshPackages("", true));
       $("packageUp").addEventListener("click", () => refreshPackages(state.packages?.parent || "", true));

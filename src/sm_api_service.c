@@ -2111,7 +2111,7 @@ static bool handle_index_page(struct MHD_Connection *connection) {
                                "web UI is not a regular file");
   }
   /* Check the Saves UI revision in <head> before serving an override. */
-  const char ui_marker[] = "<meta name=\"shadowmount-saves\" content=\"6\">";
+  const char ui_marker[] = "<meta name=\"shadowmount-saves\" content=\"3\">";
   char head[4096];
   ssize_t size = pread(fd, head, sizeof head - 1, 0);
   if (size > 0) head[size] = '\0';
@@ -3264,26 +3264,19 @@ static void handle_sm_saves_backup(struct MHD_Connection *connection,
                                    struct json_object *request) {
   struct json_object *enabled = NULL;
   struct json_object *run = NULL;
-  struct json_object *interval = NULL;
   const bool change = json_object_object_get_ex(request, "enabled", &enabled);
   const bool start = json_object_object_get_ex(request, "run", &run);
-  const bool schedule = json_object_object_get_ex(request, "interval_minutes", &interval);
-  if (change || start || schedule) {
+  if (change || start) {
     if (!allow_save_mutation(connection, "X-SM-Save-Backup"))
       return;
     if ((change && !json_object_is_type(enabled, json_type_boolean)) ||
         (start && (!json_object_is_type(run, json_type_boolean) ||
-                   !json_object_get_boolean(run))) || change + start + schedule > 1 ||
-        (schedule && (!json_object_is_type(interval, json_type_int) ||
-                      json_object_get_int64(interval) < 1 ||
-                      json_object_get_int64(interval) > SM_PS5SAVE_MAX_INTERVAL_MINUTES))) {
+                   !json_object_get_boolean(run))) || (change && start)) {
       send_error_response(connection, 400, EINVAL, "invalid backup action");
       return;
     }
-    int rc;
-    if (schedule) rc = sm_ps5save_backup_set_interval(json_object_get_int(interval));
-    else if (change) rc = sm_ps5save_backup_set_enabled(json_object_get_boolean(enabled));
-    else rc = sm_ps5save_backup_request();
+    const int rc = change ? sm_ps5save_backup_set_enabled(json_object_get_boolean(enabled))
+                          : sm_ps5save_backup_request();
     if (rc != 0) {
       send_error_response(connection, operation_http_status(rc), rc, strerror(rc));
       return;
@@ -3296,10 +3289,7 @@ static void handle_sm_saves_backup(struct MHD_Connection *connection,
       !add_json_bool(response, "enabled", state.enabled) ||
       !add_json_bool(response, "busy", state.busy) ||
       !add_json_int(response, "interval_seconds", state.interval_seconds) ||
-      !add_json_int(response, "last_copy_at", state.last_copy_at) ||
-      !add_json_bool(response, "last_copy_ok", state.last_copy_ok) ||
-      !add_json_bool(response, "configured", state.configured) ||
-      !add_json_bool(response, "trophies", state.trophies) ||
+      !add_json_int(response, "daily_snapshots", state.daily_snapshots) ||
       !add_json_bool(response, "ps4", state.ps4) ||
       !add_json_bool(response, "ps5", state.ps5)) {
     if (response) json_object_put(response);
