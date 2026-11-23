@@ -8,7 +8,7 @@ BUILD_TIME := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 HOMEBREW_ROOT := $(PS5_PAYLOAD_SDK)/target/user/homebrew
 JSON_C_PREFIX := $(CURDIR)/.deps/json-c
 JSON_C_LIB := $(JSON_C_PREFIX)/lib/libjson-c.a
-JSON_C_OBJS := src/sm_api_service.o src/sm_appdb.o src/sm_gameinfo.o src/sm_kraken.o src/sm_pkg.o src/sm_config_file.o
+JSON_C_OBJS := src/sm_api_service.o src/sm_appdb.o src/sm_gameinfo.o src/sm_kraken.o src/sm_pkg.o src/sm_config_file.o src/sm_ps5save_core.o src/sm_ps5save_catalog.o src/sm_ps5save_service.o
 HOMEBREW_CFLAGS := -I$(JSON_C_PREFIX)/include -I$(HOMEBREW_ROOT)/include
 MHD_LIB := $(HOMEBREW_ROOT)/lib/libmicrohttpd.a
 PNG_LIB := $(HOMEBREW_ROOT)/lib/libpng16.a
@@ -24,7 +24,7 @@ CFLAGS += -I$(JSON_C_PREFIX)/include
 LDFLAGS := -flto=thin -Wl,--gc-sections
 
 # Libraries
-LIBS := -lSceNotification -lSceSystemService -lSceUserService -lSceAppInstUtil -lSceNet -lSceSsl -lSceHttp -lSceIpmi -lsqlite3 $(JSON_C_LIB) $(MHD_LIB) $(PNG_LIB) $(JPEG_LIB) $(ZLIB_LIB) $(SMB_LIB) -lpthread -lm
+LIBS := -lSceNotification -lSceSystemService -lSceUserService -lSceAppInstUtil -lSceFsInternalForVsh -lSceNet -lSceSsl -lSceHttp -lSceIpmi -lsqlite3 $(JSON_C_LIB) $(MHD_LIB) $(PNG_LIB) $(JPEG_LIB) $(ZLIB_LIB) $(SMB_LIB) -lpthread -lm
 PS5_SCE_STUBS_DIR ?= $(PS5_PAYLOAD_SDK)/src/sce_stubs
 KERNEL_SYS_STUB_SO := src/libkernel_sys_ext.so
 KERNEL_SYS_STUB_SRCS := $(PS5_SCE_STUBS_DIR)/libkernel_sys.c src/libkernel_sys_ext.c
@@ -95,6 +95,7 @@ src/main.o src/sm_image_index.o: CFLAGS += -DSHADOWMOUNT_BUILD_TIME=\"$(BUILD_TI
 src/main.o src/sm_image_index.o: FORCE
 
 src/sm_l10n.o: $(L10N_CATALOGS)
+src/sm_ps5save_backup.o: $(wildcard vendor/ps5save/*.h)
 src/sm_ampr_updater.o: src/sm_ampr_ca.inc
 src/sm_shellcore_offsets.o: src/sm_shellcore_offsets.inc
 

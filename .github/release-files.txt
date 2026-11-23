@@ -3,6 +3,7 @@
 
 shadowmountplus.elf
 config.ini.example
+ps5save-backup.conf
 LICENSE
 make_image.bat
 mkexfat.sh
@@ -23,3 +24,4 @@ licenses/libsmb2-LGPL-2.1.txt
 licenses/kraken-sha3-NOTICES.txt
 vendor/kraken/LICENSE
 vendor/kraken/THIRD_PARTY_NOTICES
+vendor/ps5save/LICENSE

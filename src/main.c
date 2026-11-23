@@ -32,6 +32,7 @@
 #include "sm_limits.h"
 #include "sm_mdbg.h"
 #include "sm_paths.h"
+#include "sm_ps5save_backup.h"
 
 #ifndef SHADOWMOUNT_VERSION
 #define SHADOWMOUNT_VERSION "unknown"
@@ -557,6 +558,12 @@ int main(void) {
   sceAppInstUtilInitialize();
   kernel_set_ucred_authid(-1, AUTHID_BASE);
   install_signal_handlers();
+  /* All workers inherit SIGPIPE blocked. Sony save mounting briefly
+   * changes SIGPIPE to default on its own thread (FW 13.60). */
+  sigset_t sm_save_sigpipe;
+  sigemptyset(&sm_save_sigpipe);
+  sigaddset(&sm_save_sigpipe, SIGPIPE);
+  (void)pthread_sigmask(SIG_BLOCK, &sm_save_sigpipe, NULL);
 
   mkdir(LOG_DIR, 0777);
   existing_pid = find_pid_by_name(PAYLOAD_NAME, true);
@@ -681,6 +688,8 @@ int main(void) {
     goto shutdown;
   }
   log_debug("[STARTUP] scanner startup sync done");
+  if (!sm_ps5save_backup_start())
+    log_debug("  [SAVES] backup worker could not start");
   if (!sm_api_service_start())
     log_debug("  [API] HTTP/JSON service unavailable: %s", strerror(errno));
   sm_scanner_run_loop();
@@ -688,6 +697,7 @@ int main(void) {
 shutdown:
   sm_ampr_updater_stop();
   sm_api_service_stop();
+  sm_ps5save_backup_stop();
   // Stop ShellCore producers before their lifecycle and mount-state owners.
   sm_shellcore_flags_stop();
   sm_shellcore_hooks_stop();

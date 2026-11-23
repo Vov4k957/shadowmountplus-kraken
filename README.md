@@ -161,7 +161,16 @@ This works for supported game folders and image files. Updates to the list are d
 
 ## Web interface: library and installation
 
-The built-in web interface is a game library and installation manager, not just a configuration page. It is available through the **ShadowMount+** launcher on the PS5 or at `http://<PS5_IP>:10101` on a trusted local network. The main tabs are **Library**, **Installation**, and **Settings**. The interface also supports TV screens and gamepad navigation.
+The built-in web interface is available through the **ShadowMount+** launcher on the PS5 or at `http://<PS5_IP>:10101` on a trusted local network. The main tabs are **Library**, **Installation**, **Saves**, and **Settings**. The interface also supports TV screens and gamepad navigation.
+
+### Saves on M.2
+
+- The **Saves** tab reads current copies and daily snapshots from `/mnt/ext1/PS5Save/`. It uses the existing `backup.conf` there. For a fresh setup, copy `ps5save-backup.conf` to that folder as `backup.conf`.
+- The integrated backup worker starts with SM+. The supplied configuration checks PS4 and PS5 saves for all local profiles every 60 seconds, retains three daily snapshots, and defers saves from games that are still open. The tab provides a manual pass and an automatic-backup toggle.
+- To restore, close the game and pick a profile, backup and slot. A profile needs an existing in-game save to receive the restored files. The current save is backed up under `/data/ps5upload/save-backups/` before replacement, and the selected profile's `sce_sys` metadata is preserved.
+- Remove the standalone `backup-m2.elf` from autostart when switching to the integrated worker. Both builds use the same backup directory.
+
+The backup code is based on heni0xyz's PS5Save v2, with the user's M.2 adaptation. The save tree and restore validation come from the PS5Upload 12.4.20 M.2 fork. See `vendor/ps5save/LICENSE`.
 
 ### Library: browse and manage games
 

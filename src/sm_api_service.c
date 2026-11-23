@@ -11,6 +11,8 @@
 
 #include "sm_api_protocol.h"
 #include "sm_api_service.h"
+#include "sm_ps5save_backup.h"
+#include "sm_ps5save_restore.h"
 #include "sm_appdb.h"
 #include "sm_config_mount.h"
 #include "sm_filesystem.h"
@@ -2080,14 +2082,18 @@ static bool handle_game_icon(struct MHD_Connection *connection) {
                             "public, max-age=86400, immutable");
 }
 
+static bool send_index_page(struct MHD_Connection *connection) {
+  return send_embedded_response(connection, web_index_html,
+                                (size_t)web_index_html_len,
+                                "text/html; charset=utf-8", "no-cache");
+}
+
 static bool handle_index_page(struct MHD_Connection *connection) {
-  int fd = open(WEB_INDEX_FILE, O_RDONLY);
+  int fd = open(WEB_INDEX_FILE, O_RDONLY | O_NONBLOCK);
   if (fd < 0) {
     int status = errno != 0 ? errno : EIO;
     if (status == ENOENT || status == ENOTDIR)
-      return send_embedded_response(connection, web_index_html,
-                                     (size_t)web_index_html_len,
-                                     "text/html; charset=utf-8", "no-cache");
+      return send_index_page(connection);
     return send_error_response(connection, operation_http_status(status),
                                status, strerror(status));
   }
@@ -2103,6 +2109,15 @@ static bool handle_index_page(struct MHD_Connection *connection) {
     (void)close(fd);
     return send_error_response(connection, 404, ENOENT,
                                "web UI is not a regular file");
+  }
+  /* Check the Saves UI revision in <head> before serving an override. */
+  const char ui_marker[] = "<meta name=\"shadowmount-saves\" content=\"3\">";
+  char head[4096];
+  ssize_t size = pread(fd, head, sizeof head - 1, 0);
+  if (size > 0) head[size] = '\0';
+  if (size <= 0 || !strstr(head, ui_marker)) {
+    (void)close(fd);
+    return send_index_page(connection);
   }
   return send_file_response(connection, fd, (uint64_t)st.st_size,
                             "text/html; charset=utf-8", "no-cache");
@@ -3198,11 +3213,162 @@ static void handle_game_fakelib(struct MHD_Connection *connection,
   json_object_put(response);
 }
 
+
+static bool sm_save_json_field(struct json_object *request, const char *name,
+                               char *out, size_t cap, bool required) {
+  struct json_object *value = NULL;
+  if (!json_object_object_get_ex(request, name, &value)) {
+    if (required) return false;
+    if (cap) out[0] = '\0';
+    return true;
+  }
+  if (!value || !json_object_is_type(value, json_type_string)) return false;
+  const char *str = json_object_get_string(value);
+  size_t n = (size_t)json_object_get_string_len(value);
+  if (!str || n >= cap || strlen(str) != n) return false;
+  memcpy(out, str, n + 1);
+  return true;
+}
+static void handle_sm_saves_catalog(struct MHD_Connection *connection,
+                                    struct json_object *request) {
+  char user[9] = {0};
+  if (!sm_save_json_field(request, "user", user, sizeof user, false)) {
+    send_error_response(connection, 400, EINVAL, "bad user id");
+    return;
+  }
+  struct json_object *response = sm_ps5save_catalog(user);
+  if (!response) { send_out_of_memory_response(connection); return; }
+  (void)send_json_object(connection, 200, response);
+  json_object_put(response);
+}
+static bool allow_save_mutation(struct MHD_Connection *connection,
+                                const char *header) {
+  const char *ack = MHD_lookup_connection_value(connection, MHD_HEADER_KIND, header);
+  const char *origin = MHD_lookup_connection_value(connection, MHD_HEADER_KIND,
+                                                  MHD_HTTP_HEADER_ORIGIN);
+  const char *host = MHD_lookup_connection_value(connection, MHD_HEADER_KIND,
+                                                MHD_HTTP_HEADER_HOST);
+  char expected_origin[256];
+  if (!ack || strcmp(ack, "confirmed") || !host ||
+      snprintf(expected_origin, sizeof(expected_origin), "http://%s", host) >=
+          (int)sizeof(expected_origin) ||
+      (origin && strcmp(origin, expected_origin))) {
+    send_error_response(connection, 403, EACCES,
+                        "save mutation requires same-origin confirmation");
+    return false;
+  }
+  return true;
+}
+
+static void handle_sm_saves_backup(struct MHD_Connection *connection,
+                                   struct json_object *request) {
+  struct json_object *enabled = NULL;
+  struct json_object *run = NULL;
+  const bool change = json_object_object_get_ex(request, "enabled", &enabled);
+  const bool start = json_object_object_get_ex(request, "run", &run);
+  if (change || start) {
+    if (!allow_save_mutation(connection, "X-SM-Save-Backup"))
+      return;
+    if ((change && !json_object_is_type(enabled, json_type_boolean)) ||
+        (start && (!json_object_is_type(run, json_type_boolean) ||
+                   !json_object_get_boolean(run))) || (change && start)) {
+      send_error_response(connection, 400, EINVAL, "invalid backup action");
+      return;
+    }
+    const int rc = change ? sm_ps5save_backup_set_enabled(json_object_get_boolean(enabled))
+                          : sm_ps5save_backup_request();
+    if (rc != 0) {
+      send_error_response(connection, operation_http_status(rc), rc, strerror(rc));
+      return;
+    }
+  }
+  const sm_ps5save_backup_status_t state = sm_ps5save_backup_status();
+  struct json_object *response = new_status_response(0);
+  if (!response ||
+      !add_json_string(response, "state", state.state) ||
+      !add_json_bool(response, "enabled", state.enabled) ||
+      !add_json_bool(response, "busy", state.busy) ||
+      !add_json_int(response, "interval_seconds", state.interval_seconds) ||
+      !add_json_int(response, "daily_snapshots", state.daily_snapshots) ||
+      !add_json_bool(response, "ps4", state.ps4) ||
+      !add_json_bool(response, "ps5", state.ps5)) {
+    if (response) json_object_put(response);
+    send_out_of_memory_response(connection);
+    return;
+  }
+  (void)send_json_object(connection, 200, response);
+  json_object_put(response);
+}
+
+static void handle_sm_saves_restore(struct MHD_Connection *connection,
+                                   struct json_object *request) {
+  if (!allow_save_mutation(connection, "X-SM-Save-Restore"))
+    return;
+  sm_ps5save_request_t r = {0};
+  if (!sm_save_json_field(request, "user", r.user, sizeof r.user, true) ||
+      !sm_save_json_field(request, "backup_user", r.backup_user, sizeof r.backup_user, true) ||
+      !sm_save_json_field(request, "title_id", r.title_id, sizeof r.title_id, true) ||
+      !sm_save_json_field(request, "platform", r.platform, sizeof r.platform, true) ||
+      !sm_save_json_field(request, "version", r.version, sizeof r.version, true) ||
+      !sm_save_json_field(request, "slot", r.slot, sizeof r.slot, true) ||
+      !sm_save_json_field(request, "image", r.image, sizeof r.image, true)) {
+    send_error_response(connection, 400, EINVAL, "invalid PS5Save request");
+    return;
+  }
+  /* A save mutation must not race the library scanner, a Kraken game
+   * installation or ShellCore preparing a title to launch. */
+  if (!sm_ps5save_try_begin_restore()) {
+    send_operation_error_response(connection, EBUSY, "backup_busy");
+    return;
+  }
+  if (!sm_scanner_try_begin_external_mutation()) {
+    sm_ps5save_end_restore();
+    send_operation_error_response(connection, EBUSY, "scanner_busy");
+    return;
+  }
+  if (!sm_shellcore_try_begin_external_mutation()) {
+    sm_scanner_end_external_mutation();
+    sm_ps5save_end_restore();
+    send_operation_error_response(connection, EBUSY, "runtime_busy");
+    return;
+  }
+  (void)MHD_set_connection_option(connection, MHD_CONNECTION_OPTION_TIMEOUT, 600u);
+  const char *reason = "unknown";
+  char backup[256];
+  int restore_status = sm_ps5save_restore(&r, &reason, backup, sizeof backup);
+  sm_shellcore_end_external_mutation();
+  sm_scanner_end_external_mutation();
+  sm_ps5save_end_restore();
+  if (restore_status != 0) {
+    int status = (!strcmp(reason, "restore_busy") ||
+                  !strcmp(reason, "game_running") ||
+                  !strcmp(reason, "mount_busy_or_orphaned")) ? EBUSY : EIO;
+    send_operation_error_response(connection, status, reason);
+    return;
+  }
+  struct json_object *response = new_status_response(0);
+  if (!response || !add_json_bool(response, "restored", true) ||
+      !add_json_string(response, "title_id", r.title_id) ||
+      !add_json_string(response, "backup_path", backup)) {
+    if (response) json_object_put(response);
+    send_out_of_memory_response(connection);
+    return;
+  }
+  (void)send_json_object(connection, 200, response);
+  json_object_put(response);
+}
+
 static void dispatch_request(struct MHD_Connection *connection,
                              const char *route,
                              struct json_object *json) {
   if (strcmp(route, SM_API_ROUTE_VERSION) == 0) {
     handle_version(connection);
+  } else if (strcmp(route, SM_API_ROUTE_SAVES_CATALOG) == 0) {
+    handle_sm_saves_catalog(connection, json);
+  } else if (strcmp(route, SM_API_ROUTE_SAVES_RESTORE) == 0) {
+    handle_sm_saves_restore(connection, json);
+  } else if (strcmp(route, SM_API_ROUTE_SAVES_BACKUP) == 0) {
+    handle_sm_saves_backup(connection, json);
   } else if (strcmp(route, SM_API_ROUTE_STORAGE) == 0) {
     handle_storage(connection, json);
   } else if (strcmp(route, SM_API_ROUTE_STORAGE_EJECT) == 0) {
@@ -6366,6 +6532,8 @@ static enum MHD_Result handle_http_request(
     bool queued = false;
     if (strcmp(url, SM_API_ROUTE_INDEX) == 0)
       queued = handle_index_page(connection);
+    else if (strcmp(url, SM_API_ROUTE_SAVES_PAGE) == 0)
+      queued = send_index_page(connection);
     else if (strcmp(url, SM_API_ROUTE_FAVICON) == 0)
       queued = send_embedded_response(connection, smp_icon_png,
                                        (size_t)smp_icon_png_len,

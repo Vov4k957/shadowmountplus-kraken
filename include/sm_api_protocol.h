@@ -9,6 +9,10 @@
 
 #define SM_API_ROUTE_INDEX "/"
 #define SM_API_ROUTE_FAVICON "/favicon.png"
+#define SM_API_ROUTE_SAVES_PAGE "/saves"
+#define SM_API_ROUTE_SAVES_CATALOG "/api/v1/saves/catalog"
+#define SM_API_ROUTE_SAVES_RESTORE "/api/v1/saves/restore"
+#define SM_API_ROUTE_SAVES_BACKUP "/api/v1/saves/backup"
 #define SM_API_ROUTE_VERSION "/api/v1/version"
 #define SM_API_ROUTE_STORAGE "/api/v1/storage"
 #define SM_API_ROUTE_STORAGE_EJECT "/api/v1/storage/eject"
