@@ -128,7 +128,10 @@ along with this program; see the file COPYING. If not, see
 
 #define CONF_PATH     "backup.conf"
 #define BACKUP_ROOT   "backup"
-#define LAST_COPY_PATH ".smp-last-copy"
+#define LEGACY_BACKUP_STATUS ".smp-last-copy"
+#ifndef BACKUP_STATUS_FILE
+#define BACKUP_STATUS_FILE LOG_DIR "/save-backup.status"
+#endif
 #define TMP_IMG       TMP_DIR "/_backup_tmp_image"
 #define MOUNT_POINT   PFS_ROOT "/savebackup_tmp"
 #define BYTES_PER_MB  1000000ULL /* decimal megabytes */
@@ -187,7 +190,9 @@ typedef enum { SV_OK, SV_FAILED, SV_GAME } sv_result_t;
 
 
 static char *g_buf;
+static int g_backup_volume = -1;
 static int g_backup_directory = -1;
+static dev_t g_backup_device;
 static atomic_bool g_stopping = false;
 static pthread_mutex_t g_status_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_save_io_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -223,6 +228,18 @@ backup_fopen(const char *path, const char *mode) {
   FILE *file = fdopen(fd, mode);
   if(!file) close(fd);
   return file;
+}
+
+/* Create first. Remove a temporary left by an interrupted pass only when
+ * the name is occupied. The destination is always committed by rename. */
+static int
+open_backup_temporary(int parent, const char *path, mode_t mode) {
+  const int flags = O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW;
+  int fd = openat(parent, path, flags, mode);
+  if(fd < 0 && errno == EEXIST &&
+     (!unlinkat(parent, path, 0) || errno == ENOENT))
+    fd = openat(parent, path, flags, mode);
+  return fd;
 }
 
 static DIR *
@@ -445,7 +462,7 @@ fs_free(const char *path, const char *test_env) {
   (void)test_env;
 #endif
 
-  if((path ? statfs(path, &sf) : fstatfs(g_backup_directory, &sf)) ||
+  if((path ? statfs(path, &sf) : fstatfs(g_backup_volume, &sf)) ||
      (int64_t)sf.f_bavail <= 0) {
     return 0;
   }
@@ -557,6 +574,7 @@ backup_file(const char *src, const char *dst, const struct stat *st,
   int out = -1;
   int ok = 0;
   int aborted = 0;
+  bool have_temp = false;
   unsigned reads = 0;
 
   int progress_started = 0;
@@ -581,9 +599,7 @@ backup_file(const char *src, const char *dst, const struct stat *st,
     return;
   }
 
-  tmp[0] = 0;
   if(snprintf(tmp, sizeof tmp, "%s.part", dst) >= (int)sizeof tmp) {
-    tmp[0] = 0;
     goto done;
   }
 
@@ -617,14 +633,10 @@ backup_file(const char *src, const char *dst, const struct stat *st,
     progress_started = 1;
   }
   backup_activity_begin();
-  if(unlinkat(g_backup_directory, tmp, 0) && errno != ENOENT) {
-    tmp[0] = 0;
+  if((out = open_backup_temporary(g_backup_directory, tmp, 0666)) < 0) {
     goto done;
   }
-  if((out = openat(g_backup_directory, tmp,
-                   O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0666)) < 0) {
-    goto done;
-  }
+  have_temp = true;
 
   while(!interrupted() && (n = read(in, g_buf, COPY_BUF_SZ)) > 0) {
     char *p = g_buf;
@@ -688,7 +700,7 @@ done:
     stats->copied++;
     stats->bytes += st->st_size;
   } else {
-    if(tmp[0]) {
+    if(have_temp) {
       unlinkat(g_backup_directory, tmp, 0);
     }
     if(!aborted) {
@@ -1846,46 +1858,62 @@ read_backup_config(FILE *file, backup_stats_t *stats) {
 
 static void
 load_last_copy(void) {
-  FILE *file = backup_fopen(LAST_COPY_PATH, "r");
+  int fd = open(BACKUP_STATUS_FILE, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+  if(fd < 0 && errno == ENOENT && g_backup_directory >= 0)
+    fd = openat(g_backup_directory, LEGACY_BACKUP_STATUS, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+  if(fd < 0) return;
+  struct stat st;
+  FILE *file = !fstat(fd, &st) && S_ISREG(st.st_mode) ? fdopen(fd, "r") : NULL;
+  if(!file) {
+    close(fd);
+    return;
+  }
   long long when = 0;
   int ok = 0;
-  if(file) {
-    struct stat st;
-    if(fstat(fileno(file), &st) || !S_ISREG(st.st_mode) ||
-       fscanf(file, "SMP1 %lld %d", &when, &ok) != 2 ||
-       when <= 0 || (ok != 0 && ok != 1)) when = 0;
-    fclose(file);
+  bool valid = fscanf(file, "SMP1 %lld %d", &when, &ok) == 2 &&
+               when > 0 && (ok == 0 || ok == 1);
+  fclose(file);
+  if(valid) {
+    pthread_mutex_lock(&g_status_lock);
+    if(!g_backup_status.last_copy_at) {
+      g_backup_status.last_copy_at = when;
+      g_backup_status.last_copy_ok = ok != 0;
+    }
+    pthread_mutex_unlock(&g_status_lock);
   }
-  pthread_mutex_lock(&g_status_lock);
-  g_backup_status.last_copy_at = when;
-  g_backup_status.last_copy_ok = when > 0 && ok != 0;
-  pthread_mutex_unlock(&g_status_lock);
 }
 
-static int
+static void
 record_last_copy(bool ok) {
   long long when = wall_clock();
-  int fd = -1;
-  if(!unlinkat(g_backup_directory, LAST_COPY_PATH ".part", 0) || errno == ENOENT)
-    fd = openat(g_backup_directory, LAST_COPY_PATH ".part",
-                O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
-  FILE *file = fd >= 0 ? fdopen(fd, "w") : NULL;
-  int rc = -1;
-  if(file) {
-    bool written = fprintf(file, "SMP1 %lld %d\n", when, ok) > 0 &&
-        !fflush(file) && !fsync(fileno(file));
-    if(fclose(file)) written = false;
-    if(written)
-      rc = renameat(g_backup_directory, LAST_COPY_PATH ".part",
-                    g_backup_directory, LAST_COPY_PATH);
-    if(!rc) rc = sync_backup_directory(g_backup_directory);
-  } else if(fd >= 0) close(fd);
-  if(rc) (void)unlinkat(g_backup_directory, LAST_COPY_PATH ".part", 0);
   pthread_mutex_lock(&g_status_lock);
   g_backup_status.last_copy_at = when;
-  g_backup_status.last_copy_ok = ok && !rc;
+  g_backup_status.last_copy_ok = ok;
   pthread_mutex_unlock(&g_status_lock);
-  return rc;
+
+  /* Keep the copy result in the same local state directory as the log and
+   * the pause setting. A status-file error cannot change the copy result. */
+  char temp[] = BACKUP_STATUS_FILE ".XXXXXX";
+  char data[64];
+  int size = snprintf(data, sizeof data, "SMP1 %lld %d\n", when, ok);
+  int fd = mkstemp(temp);
+  int error = 0;
+  if(fd < 0) {
+    error = errno ? errno : EIO;
+  } else {
+    if(size <= 0 || size >= (int)sizeof data) error = EOVERFLOW;
+    else {
+      ssize_t written = write(fd, data, (size_t)size);
+      if(written != size) error = written < 0 && errno ? errno : EIO;
+      else if(fsync(fd)) error = errno ? errno : EIO;
+    }
+    if(close(fd) && !error) error = errno ? errno : EIO;
+    if(!error && rename(temp, BACKUP_STATUS_FILE)) error = errno ? errno : EIO;
+    if(error) (void)unlink(temp);
+  }
+  if(error)
+    logq("Cannot save last backup status in " BACKUP_STATUS_FILE ": %s (errno %d)",
+         strerror(error), error);
 }
 
 /** Run one backup pass against the open destination directory. */
@@ -1933,11 +1961,8 @@ run_cycle(FILE *f, int pending_only) {
 
   index_save();
   progress_stop();
-  if((stats.copied || (stats.failed && !interrupted())) &&
-     record_last_copy(!stats.failed && !interrupted())) {
-    logq("Cannot save last backup result on M.2");
-    stats.failed++;
-  }
+  if(stats.copied || (stats.failed && !interrupted()))
+    record_last_copy(!stats.failed && !interrupted());
 
   if(stats.failed) {
     /* announce only on the first failed cycle until recovery */
@@ -1978,23 +2003,11 @@ on_mounted_ssd(int fd) {
 
 static bool
 same_backup_volume(int fd) {
-  struct statfs root, child;
-  bool same;
-  if(!fstatfs(g_backup_directory, &root) && !fstatfs(fd, &child)) {
-    same = !memcmp(&root.f_fsid, &child.f_fsid, sizeof root.f_fsid);
-  } else if(errno == EPERM) {
-    /* The root has already passed the mounted-SSD check. The console can
-     * allow opening a directory while denying its filesystem query. */
-    struct stat root_stat, child_stat;
-    if(fstat(g_backup_directory, &root_stat) || fstat(fd, &child_stat)) return false;
-    same = root_stat.st_dev == child_stat.st_dev;
-    if(same && !seen_before("m2:fstatfs-denied"))
-      logq("M.2 directory verified using its device ID after fstatfs returned EPERM");
-  } else {
-    return false;
-  }
-  if(!same) errno = EXDEV;
-  return same;
+  struct stat st;
+  if(fstat(fd, &st)) return false;
+  if(st.st_dev == g_backup_device) return true;
+  errno = EXDEV;
+  return false;
 }
 
 /* Keep the standalone utility's loopback lease. Never contact the listener:
@@ -2019,23 +2032,31 @@ reserve_ps5save_port(void) {
 }
 
 static int
-open_backup_root(void) {
+open_backup_volume(void) {
   int volume = open(M2_MOUNT, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
-  if(volume < 0 || !on_mounted_ssd(volume)) {
-    if(volume >= 0) close(volume);
-    errno = ENODEV;
-    return -1;
-  }
+  if(volume >= 0 && on_mounted_ssd(volume)) return volume;
+  if(volume >= 0) close(volume);
+  errno = ENODEV;
+  return -1;
+}
+
+static int
+open_backup_root(int volume, dev_t *device) {
+  struct stat mount_stat, root_stat;
+  if(fstat(volume, &mount_stat)) return -1;
   int fd = openat(volume, M2_BACKUP_DIR, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
-  int error = errno;
-  close(volume);
-  if(fd >= 0 && !on_mounted_ssd(fd)) {
-    close(fd);
-    fd = -1;
-    error = ENODEV;
+  if(fd < 0) return -1;
+  if(!fstat(fd, &root_stat)) {
+    if(root_stat.st_dev == mount_stat.st_dev) {
+      if(device) *device = mount_stat.st_dev;
+      return fd;
+    }
+    errno = EXDEV;
   }
+  int error = errno ? errno : EIO;
+  close(fd);
   errno = error;
-  return fd;
+  return -1;
 }
 
 static FILE *
@@ -2057,10 +2078,14 @@ open_backup_config(int root, struct stat *st) {
 
 static const char *
 run_m2_backup(bool pending_only, bool maintenance_only, bool *prepared, bool *configured) {
-  g_backup_directory = open_backup_root();
+  g_backup_volume = open_backup_volume();
+  g_backup_directory = g_backup_volume >= 0
+      ? open_backup_root(g_backup_volume, &g_backup_device) : -1;
   if(g_backup_directory < 0) {
-    *prepared = *configured = false;
     int error = errno;
+    if(g_backup_volume >= 0) close(g_backup_volume);
+    g_backup_volume = -1;
+    *prepared = *configured = false;
     if(error == ENODEV) return "no_m2";
     if(error == ENOENT) return "no_config";
     logq("Cannot open " M2_MOUNT "/" M2_BACKUP_DIR ": %s (errno %d)",
@@ -2109,7 +2134,9 @@ run_m2_backup(bool pending_only, bool maintenance_only, bool *prepared, bool *co
     if(folders_ready && !interrupted()) outcome = "config_error";
   }
   close(g_backup_directory);
+  close(g_backup_volume);
   g_backup_directory = -1;
+  g_backup_volume = -1;
   return outcome;
 }
 
@@ -2230,6 +2257,7 @@ sm_ps5save_backup_start(void) {
   g_schedule_revision = 0;
   g_schedule_changed = 0;
   g_last_failed = 0;
+  load_last_copy();
   atomic_store(&g_stopping, false);
   g_buf = malloc(COPY_BUF_SZ);
   if(!g_buf) {
@@ -2327,17 +2355,14 @@ save_backup_interval(int root, long seconds) {
   struct stat st;
   FILE *input = open_backup_config(root, &st);
   if(!input) return errno;
-  if(unlinkat(root, temp, 0) && errno != ENOENT) {
-    int error = errno;
-    fclose(input);
-    return error;
-  }
-  int fd = openat(root, temp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW,
-                  st.st_mode & 0777);
+  int fd = open_backup_temporary(root, temp, st.st_mode & 0777);
   FILE *output = fd >= 0 ? fdopen(fd, "w") : NULL;
   if(!output) {
-    int error = errno;
-    if(fd >= 0) close(fd);
+    int error = errno ? errno : EIO;
+    if(fd >= 0) {
+      close(fd);
+      (void)unlinkat(root, temp, 0);
+    }
     fclose(input);
     return error;
   }
@@ -2377,9 +2402,11 @@ sm_ps5save_backup_set_interval(long minutes) {
   if(!g_worker_started || atomic_load(&g_stopping)) return ENODEV;
   if(runtime_sleep_mode_active()) return EBUSY;
   pthread_mutex_lock(&g_status_lock);
-  int root = open_backup_root();
+  int volume = open_backup_volume();
+  int root = volume >= 0 ? open_backup_root(volume, NULL) : -1;
   int error = root >= 0 ? save_backup_interval(root, minutes * 60L) : errno;
   if(root >= 0) close(root);
+  if(volume >= 0) close(volume);
   if(!error) {
     g_backup_status.interval_seconds = minutes * 60L;
     g_schedule_changed = now_seconds();
